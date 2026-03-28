@@ -35,6 +35,10 @@ class RenderSys(System):
         # Ambient dust pool (spawn once, recycle)
         self._dust: list[dict] = []
         self._dust_timer = 0.0
+        # Pre-allocated buffer for zoomed terrain (avoids per-frame Surface allocation
+        # and fixes a ValueError raised by pygame when the dest surface height is H
+        # but the requested scale height is H-HUD_H).
+        self._terrain_buf = pygame.Surface((W, H - HUD_H))
 
     def update(self, world: World, dt: float) -> None:
         self._time += dt
@@ -65,7 +69,8 @@ class RenderSys(System):
         if src.width > 0 and src.height > 0:
             chunk = self.terrain_surf.subsurface(src)
             if nz:
-                pygame.transform.scale(chunk, (screen_w, screen_h), scr)
+                pygame.transform.scale(chunk, (screen_w, screen_h), self._terrain_buf)
+                scr.blit(self._terrain_buf, (0, 0))
             else:
                 scr.blit(chunk, (0, 0))
 
