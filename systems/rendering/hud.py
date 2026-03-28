@@ -486,12 +486,15 @@ def _draw_ghost(surf, cam, kind, world):
     placeable = (can_place_building(world, tiles, raw_wx, raw_wy, kind, _cfg.PLAYER)
                  and _in_influence(world, raw_wx, raw_wy, _cfg.PLAYER))
     color = P['build_ok'] if placeable else P['build_no']
-    sx    = int(raw_wx - cam[0] - bw // 2)
-    sy    = int(raw_wy - cam[1] - bh // 2)
-    ghost = _get_surf(bw, bh)
+    # Screen-space position and size
+    sx    = int((raw_wx - cam[0]) * zoom - bw * zoom / 2)
+    sy    = int((raw_wy - cam[1]) * zoom - bh * zoom / 2)
+    sw    = max(1, int(bw * zoom))
+    sh    = max(1, int(bh * zoom))
+    ghost = _get_surf(sw, sh)
     ghost.fill((*color, 80))
     surf.blit(ghost, (sx, sy))
-    pygame.draw.rect(surf, color, (sx, sy, bw, bh), 2)
+    pygame.draw.rect(surf, color, (sx, sy, sw, sh), 2)
 
 
 def _draw_wall_drag_line(surf, cam, world, drag_start):
@@ -504,15 +507,17 @@ def _draw_wall_drag_line(surf, cam, world, drag_start):
     wy1 = my / zoom + cam[1]
     positions = _wall_line_centers(drag_start[0], drag_start[1], wx1, wy1)
     bw = bh = TILE
-    ghost = _get_surf(bw, bh)
     from terrain import can_place_building
     tiles = world.meta['tiles']
     for cx, cy in positions:
         placeable = (can_place_building(world, tiles, cx, cy, 'wall', _cfg.PLAYER)
                      and _in_influence(world, cx, cy, _cfg.PLAYER))
         color = P['build_ok'] if placeable else P['build_no']
-        sx    = int(cx - cam[0] - bw // 2)
-        sy    = int(cy - cam[1] - bh // 2)
+        sx    = int((cx - cam[0]) * zoom - bw * zoom / 2)
+        sy    = int((cy - cam[1]) * zoom - bh * zoom / 2)
+        sw    = max(1, int(bw * zoom))
+        sh    = max(1, int(bh * zoom))
+        ghost = _get_surf(sw, sh)
         ghost.fill((*color, 80))
         surf.blit(ghost, (sx, sy))
-        pygame.draw.rect(surf, color, (sx, sy, bw, bh), 2)
+        pygame.draw.rect(surf, color, (sx, sy, sw, sh), 2)

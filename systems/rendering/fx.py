@@ -72,20 +72,20 @@ def _building_ambient(fx: list, pos, bd, t) -> None:
 
 
 # ── FX particle rendering ────────────────────────────────────────────────────
-def draw_fx(scr, world_fx, cam, small_font):
+def draw_fx(scr, world_fx, cam, small_font, zoom=1.0):
     """Render all active FX particles. Called from RenderSys.update()."""
     for item in world_fx:
         # Line-based effects use midpoint for culling
         if 'x' in item:
-            sx = int(item['x'] - cam[0])
-            sy = int(item['y'] - cam[1])
+            sx = int((item['x'] - cam[0]) * zoom)
+            sy = int((item['y'] - cam[1]) * zoom)
         else:
-            sx = int((item.get('sx', 0) + item.get('ex', 0)) / 2 - cam[0])
-            sy = int((item.get('sy', 0) + item.get('ey', 0)) / 2 - cam[1])
+            sx = int(((item.get('sx', 0) + item.get('ex', 0)) / 2 - cam[0]) * zoom)
+            sy = int(((item.get('sy', 0) + item.get('ey', 0)) / 2 - cam[1]) * zoom)
 
         from config import W, H, HUD_H
-        sw = scr.get_width()
-        sh = scr.get_height()
+        sw = W
+        sh = H - HUD_H
         if not (-60 < sx < sw + 60 and -60 < sy < sh + 60):
             continue
 
@@ -218,10 +218,10 @@ def draw_fx(scr, world_fx, cam, small_font):
         elif item['kind'] == 'tesla_bolt':
             ratio = item['t'] / item['mt']
             alpha = int(255 * ratio)
-            sx1 = int(item['sx'] - cam[0])
-            sy1 = int(item['sy'] - cam[1])
-            ex1 = int(item['ex'] - cam[0])
-            ey1 = int(item['ey'] - cam[1])
+            sx1 = int((item['sx'] - cam[0]) * zoom)
+            sy1 = int((item['sy'] - cam[1]) * zoom)
+            ex1 = int((item['ex'] - cam[0]) * zoom)
+            ey1 = int((item['ey'] - cam[1]) * zoom)
             segs = item['segs']
             jitter = item['jitter']
             # Build jagged lightning path
@@ -246,10 +246,10 @@ def draw_fx(scr, world_fx, cam, small_font):
         elif item['kind'] == 'laser_beam':
             ratio = item['t'] / item['mt']
             alpha = int(255 * ratio)
-            sx1 = int(item['sx'] - cam[0])
-            sy1 = int(item['sy'] - cam[1])
-            ex1 = int(item['ex'] - cam[0])
-            ey1 = int(item['ey'] - cam[1])
+            sx1 = int((item['sx'] - cam[0]) * zoom)
+            sy1 = int((item['sy'] - cam[1]) * zoom)
+            ex1 = int((item['ex'] - cam[0]) * zoom)
+            ey1 = int((item['ey'] - cam[1]) * zoom)
             from systems.rendering import _cfg
             team_id = item['team']
             lc = P['laser_r'] if team_id == _cfg.PLAYER else P['laser_g']

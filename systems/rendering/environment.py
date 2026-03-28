@@ -80,18 +80,35 @@ def _draw_projectile(surf, pos, proj):
 
 
 # ── Fog of war ────────────────────────────────────────────────────────────────
-def _draw_fog(surf, fog, cam_x, cam_y):
-    # Import module-level cached surfaces
-    import systems.rendering.helpers as _h
+_fog_zoom_cache = {}  # (tile_s, kind) → Surface
+
+def _get_fog_tile(tile_s, kind):
+    key = (tile_s, kind)
+    s = _fog_zoom_cache.get(key)
+    if s is None:
+        import systems.rendering.helpers as _h
+        src = _h._fog_dark if kind == 0 else _h._fog_dim
+        if tile_s == TILE:
+            s = src
+        else:
+            s = pygame.transform.scale(src, (tile_s, tile_s))
+        _fog_zoom_cache[key] = s
+    return s
+
+
+def _draw_fog(surf, fog, cam_x, cam_y, zoom=1.0):
     _ensure_surfaces()
-    sw = surf.get_width()
-    sh = surf.get_height()
-    tile_ox = int(cam_x) % TILE
-    tile_oy = int(cam_y) % TILE
+    tile_s  = max(1, int(TILE * zoom))
+    sw = W
+    sh = H - HUD_H
+    tile_ox = int(cam_x * zoom) % tile_s
+    tile_oy = int(cam_y * zoom) % tile_s
     tx0     = int(cam_x) // TILE
     ty0     = int(cam_y) // TILE
-    cols    = sw // TILE + 2
-    rows    = sh // TILE + 2
+    cols    = sw // tile_s + 2
+    rows    = sh // tile_s + 2
+    fog_dark = _get_fog_tile(tile_s, 0)
+    fog_dim  = _get_fog_tile(tile_s, 1)
 
     for drow in range(rows):
         my = ty0 + drow
@@ -102,31 +119,32 @@ def _draw_fog(surf, fog, cam_x, cam_y):
             if not (0 <= mx < MAP_W):
                 continue
             f  = fog[my, mx]
-            sx = dcol * TILE - tile_ox
-            sy = drow * TILE - tile_oy
+            sx = dcol * tile_s - tile_ox
+            sy = drow * tile_s - tile_oy
             if f == 0:
-                surf.blit(_h._fog_dark, (sx, sy))
+                surf.blit(fog_dark, (sx, sy))
             elif f == 1:
-                surf.blit(_h._fog_dim,  (sx, sy))
+                surf.blit(fog_dim,  (sx, sy))
 
 
 # ── Water shimmer ─────────────────────────────────────────────────────────────
 _water_overlay = None
 
-def _draw_water_shimmer(surf, tiles, cam, t):
+def _draw_water_shimmer(surf, tiles, cam, t, zoom=1.0):
     """Cheaply animate water tiles with a subtle rolling highlight."""
     global _water_overlay
-    sw = surf.get_width()
-    sh = surf.get_height()
+    sw = W
+    sh = H - HUD_H
     if _water_overlay is None or _water_overlay.get_width() != sw or _water_overlay.get_height() != sh:
         _water_overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
     _water_overlay.fill((0, 0, 0, 0))
-    tile_ox = int(cam[0]) % TILE
-    tile_oy = int(cam[1]) % TILE
+    tile_s  = max(1, int(TILE * zoom))
+    tile_ox = int(cam[0] * zoom) % tile_s
+    tile_oy = int(cam[1] * zoom) % tile_s
     tx0     = int(cam[0]) // TILE
     ty0     = int(cam[1]) // TILE
-    cols    = sw // TILE + 2
-    rows    = sh // TILE + 2
+    cols    = sw // tile_s + 2
+    rows    = sh // tile_s + 2
     phase   = t * 1.2  # slow roll
     drew = False
     for drow in range(rows):
@@ -139,8 +157,8 @@ def _draw_water_shimmer(surf, tiles, cam, t):
                 continue
             if tiles[my][mx] != TWATER:
                 continue
-            sx = dcol * TILE - tile_ox
-            sy = drow * TILE - tile_oy
+            sx = dcol * tile_s - tile_ox
+            sy = drow * tile_s - tile_oy
             # Primary shimmer wave
             wave1 = math.sin(phase + mx * 0.35 + my * 0.25)
             # Secondary crossing wave for more natural look
@@ -148,16 +166,16 @@ def _draw_water_shimmer(surf, tiles, cam, t):
             alpha = int(14 + 10 * wave1 + 6 * wave2)
             if alpha > 2:
                 pygame.draw.rect(_water_overlay, (50, 120, 210, alpha),
-                                 (sx, sy, TILE, TILE))
+                                 (sx, sy, tile_s, tile_s))
                 drew = True
             # Specular highlight streak (slow moving)
             spec = math.sin(phase * 0.5 + mx * 0.6 + my * 0.15)
             if spec > 0.75:
                 sa = int(20 * (spec - 0.75) / 0.25)
-                hw = TILE // 2 + 2
+                hw = tile_s // 2 + 2
                 pygame.draw.line(_water_overlay, (140, 190, 255, sa),
-                                 (sx + 2, sy + TILE // 2),
-                                 (sx + hw, sy + TILE // 2), 1)
+                                 (sx + 2, sy + tile_s // 2),
+                                 (sx + hw, sy + tile_s // 2), 1)
                 drew = True
     if drew:
         surf.blit(_water_overlay, (0, 0), special_flags=pygame.BLEND_ADD)
@@ -169,8 +187,8 @@ _DAY_NIGHT_SURF = None
 def _draw_day_night_tint(surf, t):
     """Slow subtle colour temperature cycle (120s period). Very cheap."""
     global _DAY_NIGHT_SURF
-    sw = surf.get_width()
-    sh = surf.get_height()
+    sw = W
+    sh = H - HUD_H
     if _DAY_NIGHT_SURF is None or _DAY_NIGHT_SURF.get_width() != sw or _DAY_NIGHT_SURF.get_height() != sh:
         _DAY_NIGHT_SURF = pygame.Surface((sw, sh), pygame.SRCALPHA)
     cycle = (math.sin(t * 0.05236) + 1) * 0.5  # 0 → 1 over ~120s
@@ -188,20 +206,20 @@ def _draw_day_night_tint(surf, t):
 # ── Influence overlay ─────────────────────────────────────────────────────────
 _influence_surf = None
 
-def _draw_influence_overlay(surf, world, cam):
+def _draw_influence_overlay(surf, world, cam, zoom=1.0):
     """Additive blue tint showing player influence on the map."""
     global _influence_surf
-    sw = surf.get_width()
-    sh = surf.get_height()
+    sw = W
+    sh = H - HUD_H
     if _influence_surf is None or _influence_surf.get_width() != sw or _influence_surf.get_height() != sh:
         _influence_surf = pygame.Surface((sw, sh))
     _influence_surf.fill((0, 0, 0))
     for _eid, pos, team, bd in world.q(Position, Team, BuildingData):
         if team.id != _cfg.PLAYER:
             continue
-        cx = int(pos.x + bd.w // 2 - cam[0])
-        cy = int(pos.y + bd.h // 2 - cam[1])
-        r  = INFLUENCE_RADIUS.get(bd.kind, 200)
+        cx = int((pos.x + bd.w // 2 - cam[0]) * zoom)
+        cy = int((pos.y + bd.h // 2 - cam[1]) * zoom)
+        r  = int(INFLUENCE_RADIUS.get(bd.kind, 200) * zoom)
         if cx + r < 0 or cx - r > sw or cy + r < 0 or cy - r > sh:
             continue
         pygame.draw.circle(_influence_surf, (0, 22, 44), (cx, cy), r)     # soft fill
