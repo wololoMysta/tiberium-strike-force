@@ -1,9 +1,0 @@
-2026-03-27 21:13:45,936 [SERVER] server listening on 0.0.0.0:9876
-2026-03-27 21:13:45,938 [SERVER] Listening on ws://0.0.0.0:9876
-2026-03-27 21:13:45,938 [SERVER] Game loop started  tick=60Hz  snapshot=30Hz
-2026-03-27 21:13:45,939 [SERVER] Waiting for players to connect on ws://0.0.0.0:9876 ...
-2026-03-27 21:14:03,943 [SERVER] connection open
-2026-03-27 21:14:03,945 [SERVER] Player 0 connected from ('127.0.0.1', 56622)
-2026-03-27 21:14:03,947 [SERVER] Sent init data to player 0
-2026-03-27 21:14:15,709 [SERVER] Player 0 connection closed: code=1006 reason=''
-2026-03-27 21:14:15,711 [SERVER] Player 0 disconnected (cleaning up)
