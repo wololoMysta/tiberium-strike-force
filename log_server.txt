@@ -1,0 +1,68 @@
+2026-03-28 11:50:30,346 [SERVER] server listening on 0.0.0.0:9876
+2026-03-28 11:50:30,346 [SERVER] Listening on ws://0.0.0.0:9876
+2026-03-28 11:50:30,346 [SERVER] Game loop started  tick=60Hz  snapshot=30Hz
+2026-03-28 11:50:30,346 [SERVER] Waiting for players to connect on ws://0.0.0.0:9876 ...
+2026-03-28 11:50:32,770 [SERVER] connection open
+2026-03-28 11:50:32,770 [SERVER] Player 0 connected from ('127.0.0.1', 60461)
+2026-03-28 11:50:32,772 [SERVER] Sent init data to player 0
+2026-03-28 11:50:33,173 [SERVER] connection open
+2026-03-28 11:50:33,173 [SERVER] Player 1 connected from ('127.0.0.1', 60462)
+2026-03-28 11:50:33,175 [SERVER] Sent init data to player 1
+2026-03-28 11:53:25,720 [SERVER] server closing
+2026-03-28 11:53:25,721 [SERVER] Player 0 disconnected (cleaning up)
+2026-03-28 11:53:25,731 [SERVER] Player 1 disconnected (cleaning up)
+2026-03-28 11:53:25,732 [SERVER] server closed
+2026-03-28 11:53:25,732 [SERVER] Server crashed: KeyError: 'selected'
+Traceback (most recent call last):
+  File "c:\Users\natur\OneDrive\Dokumente\vscode\game4\server.py", line 379, in main
+    asyncio.run(server.run())
+    ~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3312.0_x64__qbz5n2kfra8p0\Lib\asyncio\runners.py", line 195, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3312.0_x64__qbz5n2kfra8p0\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3312.0_x64__qbz5n2kfra8p0\Lib\asyncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "c:\Users\natur\OneDrive\Dokumente\vscode\game4\server.py", line 373, in run
+    await self.game_loop()
+  File "c:\Users\natur\OneDrive\Dokumente\vscode\game4\server.py", line 320, in game_loop
+    sys.update(world, tick_dt)
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "c:\Users\natur\OneDrive\Dokumente\vscode\game4\systems\combat_sys.py", line 16, in update
+    _reap_dead(world)
+    ~~~~~~~~~~^^^^^^^
+  File "c:\Users\natur\OneDrive\Dokumente\vscode\game4\systems\combat_sys.py", line 149, in _reap_dead
+    meta['selected'].discard(eid)
+    ~~~~^^^^^^^^^^^^
+KeyError: 'selected'
+Traceback (most recent call last):
+  File "c:\Users\natur\OneDrive\Dokumente\vscode\game4\server.py", line 379, in main
+    asyncio.run(server.run())
+    ~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3312.0_x64__qbz5n2kfra8p0\Lib\asyncio\runners.py", line 195, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3312.0_x64__qbz5n2kfra8p0\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3312.0_x64__qbz5n2kfra8p0\Lib\asyncio\base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "c:\Users\natur\OneDrive\Dokumente\vscode\game4\server.py", line 373, in run
+    await self.game_loop()
+  File "c:\Users\natur\OneDrive\Dokumente\vscode\game4\server.py", line 320, in game_loop
+    sys.update(world, tick_dt)
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "c:\Users\natur\OneDrive\Dokumente\vscode\game4\systems\combat_sys.py", line 16, in update
+    _reap_dead(world)
+    ~~~~~~~~~~^^^^^^^
+  File "c:\Users\natur\OneDrive\Dokumente\vscode\game4\systems\combat_sys.py", line 149, in _reap_dead
+    meta['selected'].discard(eid)
+    ~~~~^^^^^^^^^^^^
+KeyError: 'selected'
+pygame 2.6.1 (SDL 2.28.4, Python 3.13.12)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+Press ENTER to close...

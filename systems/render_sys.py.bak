@@ -1,0 +1,2237 @@
+# systems/render_sys.py – all drawing: terrain, units, buildings, FX, HUD
+import math, random, pygame
+from functools import lru_cache
+from ecs import World, System
+from components import *
+from config import *
+
+
+# ── Shared game-math helpers ────────────────────────────────────────────
+def _wall_line_centers(x0: float, y0: float, x1: float, y1: float,
+                       step: int = TILE) -> list[tuple[float, float]]:
+    """Return grid-snapped wall centre positions from (x0,y0) to (x1,y1)."""
+    sx = round(x0 / step) * step
+    sy = round(y0 / step) * step
+    ex = round(x1 / step) * step
+    ey = round(y1 / step) * step
+    dx, dy = ex - sx, ey - sy
+    n = max(abs(dx), abs(dy)) // step
+    if n == 0:
+        return [(sx, sy)]
+    out: list = []
+    seen: set = set()
+    for i in range(n + 1):
+        t = i / n
+        cx = round(sx + dx * t)
+        cy = round(sy + dy * t)
+        cx = round(cx / step) * step
+        cy = round(cy / step) * step
+        if (cx, cy) not in seen:
+            seen.add((cx, cy))
+            out.append((cx, cy))
+    return out
+
+
+def _in_influence(world: World, wx: float, wy: float, team_id: int) -> bool:
+    """Return True if (wx, wy) is within any friendly building's influence radius."""
+    for _eid, pos, team, bd in world.q(Position, Team, BuildingData):
+        if team.id != team_id:
+            continue
+        bx = pos.x + bd.w / 2
+        by = pos.y + bd.h / 2
+        r  = INFLUENCE_RADIUS.get(bd.kind, 200)
+        if math.hypot(bx - wx, by - wy) <= r:
+            return True
+    return False
+
+# ── Pre-allocated surfaces ────────────────────────────────────────────────────
+_fog_dark   = None   # fully-opaque fog tile
+_fog_dim    = None   # semi-transparent explored tile
+_glow_cache: dict = {}
+_water_shimmer_surf = None   # pre-built half-transparent blue overlay for water tiles
+
+# ── Reusable surface pool (avoids per-frame Surface allocation) ───────────────
+_surf_pool: dict[tuple[int, int], pygame.Surface] = {}
+
+def _get_surf(w: int, h: int) -> pygame.Surface:
+    key = (w, h)
+    s = _surf_pool.get(key)
+    if s is None:
+        s = pygame.Surface((w, h), pygame.SRCALPHA)
+        _surf_pool[key] = s
+    else:
+        s.fill((0, 0, 0, 0))
+        s.set_alpha(None)
+    return s
+
+class _ScreenPos:
+    __slots__ = ('x', 'y')
+_spos = _ScreenPos()
+
+# Pre-computed octagon offsets for turret base (radius=17)
+_OCT_OFFSETS = tuple(
+    (int(math.cos(math.pi / 8 + i * math.pi / 4) * 17),
+     int(math.sin(math.pi / 8 + i * math.pi / 4) * 17))
+    for i in range(8)
+)
+
+
+def _ensure_surfaces() -> None:
+    global _fog_dark, _fog_dim, _water_shimmer_surf
+    if _fog_dark is None:
+        _fog_dark = pygame.Surface((TILE, TILE), pygame.SRCALPHA)
+        _fog_dark.fill((0, 0, 0, 230))
+        _fog_dim  = pygame.Surface((TILE, TILE), pygame.SRCALPHA)
+        _fog_dim.fill((0, 0, 0, 145))
+        _water_shimmer_surf = pygame.Surface((TILE, TILE), pygame.SRCALPHA)
+        _water_shimmer_surf.fill((40, 100, 200, 18))
+
+
+# ── Glow helper ───────────────────────────────────────────────────────────────
+def _glow(surf: pygame.Surface, x: int, y: int,
+          color: tuple, radius: int, alpha: int = 140) -> None:
+    color = tuple(color)
+    key = (color, radius, alpha)
+    if key not in _glow_cache:
+        s = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+        for r in range(radius, 0, -2):
+            a = int(alpha * (r / radius) ** 1.6)
+            pygame.draw.circle(s, (*color[:3], a), (radius, radius), r)
+        _glow_cache[key] = s
+    surf.blit(_glow_cache[key], (x - radius, y - radius),
+              special_flags=pygame.BLEND_ADD)
+
+
+# ── Trig helpers ──────────────────────────────────────────────────────────────
+def _rot_rect(cx, cy, w, h, angle):
+    ca, sa = math.cos(angle), math.sin(angle)
+    hw, hh = w / 2, h / 2
+    return [
+        (int(cx + (-hw) * ca - (-hh) * sa), int(cy + (-hw) * sa + (-hh) * ca)),
+        (int(cx + hw  * ca - (-hh) * sa), int(cy + hw  * sa + (-hh) * ca)),
+        (int(cx + hw  * ca - hh  * sa), int(cy + hw  * sa + hh  * ca)),
+        (int(cx + (-hw) * ca - hh  * sa), int(cy + (-hw) * sa + hh  * ca)),
+    ]
+
+
+@lru_cache(maxsize=512)
+def _darker(c: tuple, amount: int = 40) -> tuple:
+    return (max(0, c[0] - amount), max(0, c[1] - amount), max(0, c[2] - amount))
+
+
+@lru_cache(maxsize=512)
+def _lighter(c: tuple, amount: int = 40) -> tuple:
+    return (min(255, c[0] + amount), min(255, c[1] + amount), min(255, c[2] + amount))
+
+
+# ── Unit drawing ──────────────────────────────────────────────────────────────
+def _draw_infantry(surf, x, y, team, facing, selected, pulse):
+    c   = P['player'] if team == PLAYER else P['enemy']
+    dk  = _darker(c, 50)
+    # Idle bob
+    bob = math.sin(pulse * 3.5) * 1.2
+    y2 = int(y + bob)
+    # Shadow (alpha-blended)
+    sh = _get_surf(20, 10)
+    pygame.draw.ellipse(sh, (0, 0, 0, 55), (0, 0, 20, 10))
+    surf.blit(sh, (x - 10, y + 3))
+    if selected:
+        _glow(surf, x, y2, P['select'], 18, int(80 + 40 * math.sin(pulse * 6)))
+        pygame.draw.circle(surf, P['select'], (x, y2), 12, 2)
+    # Body
+    pygame.draw.circle(surf, dk, (x, y2), 9)
+    pygame.draw.circle(surf, c,  (x, y2), 8)
+    # Head direction
+    hx = int(x + math.cos(facing) * 4)
+    hy = int(y2 + math.sin(facing) * 4)
+    pygame.draw.circle(surf, _lighter(c, 30), (hx, hy), 4)
+    # Weapon
+    gx = int(x + math.cos(facing) * 13)
+    gy = int(y2 + math.sin(facing) * 13)
+    pygame.draw.line(surf, (160, 160, 160), (hx, hy), (gx, gy), 2)
+
+
+def _draw_buggy(surf, x, y, team, facing, selected, pulse):
+    c  = P['player'] if team == PLAYER else P['enemy']
+    dk = _darker(c, 60)
+    # Shadow (alpha)
+    sh = _get_surf(30, 12)
+    pygame.draw.ellipse(sh, (0, 0, 0, 50), (0, 0, 30, 12))
+    surf.blit(sh, (x - 15, y + 6))
+    if selected:
+        _glow(surf, x, y, P['select'], 22, int(80 + 40 * math.sin(pulse * 6)))
+        pygame.draw.circle(surf, P['select'], (x, y), 16, 2)
+    hull = _rot_rect(x, y, 24, 14, facing)
+    pygame.draw.polygon(surf, dk,  hull)
+    pygame.draw.polygon(surf, c,   hull, 1)
+    # Wheels
+    for sign in (-1, 1):
+        wx = int(x + math.cos(facing + math.pi / 2) * 8 * sign)
+        wy = int(y + math.sin(facing + math.pi / 2) * 8 * sign)
+        pygame.draw.circle(surf, (40, 40, 40), (wx, wy), 5)
+        pygame.draw.circle(surf, (80, 80, 80), (wx, wy), 5, 1)
+    # Gun
+    gx = int(x + math.cos(facing) * 18)
+    gy = int(y + math.sin(facing) * 18)
+    pygame.draw.line(surf, (180, 180, 180), (x, y), (gx, gy), 3)
+
+
+def _draw_tank(surf, x, y, team, facing, turret, selected, pulse):
+    c   = P['player'] if team == PLAYER else P['enemy']
+    dk  = _darker(c, 70)
+    dk2 = _darker(c, 40)
+    # Shadow (alpha)
+    sh = _get_surf(38, 14)
+    pygame.draw.ellipse(sh, (0, 0, 0, 55), (0, 0, 38, 14))
+    surf.blit(sh, (x - 19, y + 8))
+    if selected:
+        _glow(surf, x, y, P['select'], 28, int(80 + 40 * math.sin(pulse * 6)))
+        pygame.draw.circle(surf, P['select'], (x, y), 20, 2)
+    # Treads
+    for sign in (-1, 1):
+        ox = math.cos(facing + math.pi / 2) * 12 * sign
+        oy = math.sin(facing + math.pi / 2) * 12 * sign
+        tread = _rot_rect(x + ox, y + oy, 28, 8, facing)
+        pygame.draw.polygon(surf, (35, 35, 35),  tread)
+        pygame.draw.polygon(surf, (60, 60, 60),  tread, 1)
+    # Hull
+    hull = _rot_rect(x, y, 26, 18, facing)
+    pygame.draw.polygon(surf, dk,  hull)
+    pygame.draw.polygon(surf, dk2, hull, 1)
+    # Turret ring
+    pygame.draw.circle(surf, dk2, (x, y), 10)
+    pygame.draw.circle(surf, c,   (x, y), 9)
+    # Barrel
+    bx = int(x + math.cos(turret) * 20)
+    by = int(y + math.sin(turret) * 20)
+    pygame.draw.line(surf, (180, 180, 180), (x, y), (bx, by), 4)
+    pygame.draw.line(surf, (220, 220, 220), (x, y), (bx, by), 2)
+
+
+def _draw_harvester(surf, x, y, team, facing, selected, pulse):
+    c  = P['player'] if team == PLAYER else P['enemy']
+    dk = _darker(c, 50)
+    # Shadow (alpha)
+    sh = _get_surf(36, 14)
+    pygame.draw.ellipse(sh, (0, 0, 0, 50), (0, 0, 36, 14))
+    surf.blit(sh, (x - 18, y + 7))
+    if selected:
+        _glow(surf, x, y, P['select'], 25, int(80 + 40 * math.sin(pulse * 6)))
+        pygame.draw.circle(surf, P['select'], (x, y), 18, 2)
+    hull = _rot_rect(x, y, 28, 18, facing)
+    pygame.draw.polygon(surf, dk, hull)
+    pygame.draw.polygon(surf, c,  hull, 1)
+    # Scoop at front
+    fx = int(x + math.cos(facing) * 16)
+    fy = int(y + math.sin(facing) * 16)
+    pygame.draw.circle(surf, (80, 200, 80), (fx, fy), 6)
+    pygame.draw.circle(surf, P['tib_hi'],   (fx, fy), 4)
+
+
+# ── MCV (Mobile Construction Vehicle) ────────────────────────────────────────
+def _draw_mcv(surf, x, y, team, facing, selected, pulse):
+    c  = P['player'] if team == PLAYER else P['enemy']
+    dk = _darker(c, 50)
+    lt = _lighter(c, 40)
+    # Shadow
+    sh = _get_surf(48, 16)
+    pygame.draw.ellipse(sh, (0, 0, 0, 55), (0, 0, 48, 16))
+    surf.blit(sh, (x - 24, y + 10))
+    if selected:
+        _glow(surf, x, y, P['select'], 30, int(80 + 40 * math.sin(pulse * 6)))
+        pygame.draw.circle(surf, P['select'], (x, y), 24, 2)
+    # Treads
+    for sign in (-1, 1):
+        ox = math.cos(facing + math.pi / 2) * 14 * sign
+        oy = math.sin(facing + math.pi / 2) * 14 * sign
+        tread = _rot_rect(x + ox, y + oy, 34, 10, facing)
+        pygame.draw.polygon(surf, (35, 35, 35), tread)
+        pygame.draw.polygon(surf, (60, 60, 60), tread, 1)
+    # Large hull
+    hull = _rot_rect(x, y, 32, 24, facing)
+    pygame.draw.polygon(surf, dk, hull)
+    pygame.draw.polygon(surf, lt, hull, 1)
+    # Crane/arm on top
+    pygame.draw.circle(surf, _darker(c, 30), (x, y), 10)
+    pygame.draw.circle(surf, c, (x, y), 8)
+    ax = int(x + math.cos(facing) * 14)
+    ay = int(y + math.sin(facing) * 14)
+    pygame.draw.line(surf, (180, 180, 180), (x, y), (ax, ay), 3)
+    pygame.draw.circle(surf, (200, 200, 100), (ax, ay), 4)
+    pygame.draw.circle(surf, (255, 220, 60), (ax, ay), 2)
+    # Double-click deploy hint when selected
+    if selected:
+        # Two small overlapping circles to indicate double-click
+        pygame.draw.circle(surf, P['ui_hi'], (x - 4, y - 28), 5, 1)
+        pygame.draw.circle(surf, P['ui_hi'], (x + 4, y - 28), 5, 1)
+
+
+# ── Rocket Tank ───────────────────────────────────────────────────────────────
+def _draw_rocket_tank(surf, x, y, team, facing, turret, selected, pulse):
+    c   = P['player'] if team == PLAYER else P['enemy']
+    dk  = _darker(c, 70)
+    dk2 = _darker(c, 40)
+    # Shadow
+    sh = _get_surf(40, 14)
+    pygame.draw.ellipse(sh, (0, 0, 0, 55), (0, 0, 40, 14))
+    surf.blit(sh, (x - 20, y + 8))
+    if selected:
+        _glow(surf, x, y, P['select'], 28, int(80 + 40 * math.sin(pulse * 6)))
+        pygame.draw.circle(surf, P['select'], (x, y), 20, 2)
+    # Treads
+    for sign in (-1, 1):
+        ox = math.cos(facing + math.pi / 2) * 12 * sign
+        oy = math.sin(facing + math.pi / 2) * 12 * sign
+        tread = _rot_rect(x + ox, y + oy, 28, 8, facing)
+        pygame.draw.polygon(surf, (35, 35, 35), tread)
+        pygame.draw.polygon(surf, (60, 60, 60), tread, 1)
+    # Hull
+    hull = _rot_rect(x, y, 26, 20, facing)
+    pygame.draw.polygon(surf, dk, hull)
+    pygame.draw.polygon(surf, dk2, hull, 1)
+    # Rocket launcher pod (twin tubes)
+    pygame.draw.circle(surf, dk2, (x, y), 10)
+    pygame.draw.circle(surf, c, (x, y), 8)
+    for sign in (-1, 1):
+        bx = x + math.cos(turret) * 18 + math.cos(turret + math.pi/2) * 3 * sign
+        by = y + math.sin(turret) * 18 + math.sin(turret + math.pi/2) * 3 * sign
+        pygame.draw.line(surf, (120, 120, 120), (x, y), (int(bx), int(by)), 3)
+    # Orange tip marking
+    tx = int(x + math.cos(turret) * 19)
+    ty = int(y + math.sin(turret) * 19)
+    pygame.draw.circle(surf, P['rocket'], (tx, ty), 3)
+
+
+# ── Tesla Tank ────────────────────────────────────────────────────────────────
+def _draw_tesla_tank(surf, x, y, team, facing, turret, selected, pulse):
+    c   = P['player'] if team == PLAYER else P['enemy']
+    dk  = _darker(c, 70)
+    dk2 = _darker(c, 40)
+    # Shadow
+    sh = _get_surf(38, 14)
+    pygame.draw.ellipse(sh, (0, 0, 0, 55), (0, 0, 38, 14))
+    surf.blit(sh, (x - 19, y + 8))
+    if selected:
+        _glow(surf, x, y, P['select'], 28, int(80 + 40 * math.sin(pulse * 6)))
+        pygame.draw.circle(surf, P['select'], (x, y), 20, 2)
+    # Treads
+    for sign in (-1, 1):
+        ox = math.cos(facing + math.pi / 2) * 12 * sign
+        oy = math.sin(facing + math.pi / 2) * 12 * sign
+        tread = _rot_rect(x + ox, y + oy, 28, 8, facing)
+        pygame.draw.polygon(surf, (35, 35, 35), tread)
+        pygame.draw.polygon(surf, (60, 60, 60), tread, 1)
+    # Hull
+    hull = _rot_rect(x, y, 26, 18, facing)
+    pygame.draw.polygon(surf, dk, hull)
+    pygame.draw.polygon(surf, dk2, hull, 1)
+    # Tesla coil dome
+    pygame.draw.circle(surf, dk2, (x, y), 11)
+    pygame.draw.circle(surf, P['tesla'], (x, y), 9)
+    # Crackling arc antenna
+    bx = int(x + math.cos(turret) * 16)
+    by = int(y + math.sin(turret) * 16)
+    pygame.draw.line(surf, (180, 200, 240), (x, y), (bx, by), 4)
+    # Spark at tip (animated)
+    spark_a = int(120 + 80 * math.sin(pulse * 12))
+    ss = _get_surf(12, 12)
+    pygame.draw.circle(ss, (*P['tesla_hi'][:3], spark_a), (6, 6), 5)
+    surf.blit(ss, (bx - 6, by - 6), special_flags=pygame.BLEND_ADD)
+    # Ambient mini-arcs around the dome
+    for _ in range(2):
+        aa = random.uniform(0, math.tau)
+        ar = random.uniform(8, 14)
+        ax = int(x + math.cos(aa) * ar)
+        ay = int(y + math.sin(aa) * ar)
+        pygame.draw.line(surf, P['tesla_hi'], (x, y), (ax, ay), 1)
+
+
+# ── Laser Tank ────────────────────────────────────────────────────────────────
+def _draw_laser_tank(surf, x, y, team, facing, turret, selected, pulse):
+    c   = P['player'] if team == PLAYER else P['enemy']
+    dk  = _darker(c, 70)
+    dk2 = _darker(c, 40)
+    # Shadow
+    sh = _get_surf(38, 14)
+    pygame.draw.ellipse(sh, (0, 0, 0, 55), (0, 0, 38, 14))
+    surf.blit(sh, (x - 19, y + 8))
+    if selected:
+        _glow(surf, x, y, P['select'], 28, int(80 + 40 * math.sin(pulse * 6)))
+        pygame.draw.circle(surf, P['select'], (x, y), 20, 2)
+    # Treads
+    for sign in (-1, 1):
+        ox = math.cos(facing + math.pi / 2) * 12 * sign
+        oy = math.sin(facing + math.pi / 2) * 12 * sign
+        tread = _rot_rect(x + ox, y + oy, 28, 8, facing)
+        pygame.draw.polygon(surf, (35, 35, 35), tread)
+        pygame.draw.polygon(surf, (60, 60, 60), tread, 1)
+    # Sleek hull
+    hull = _rot_rect(x, y, 28, 16, facing)
+    pygame.draw.polygon(surf, dk, hull)
+    pygame.draw.polygon(surf, dk2, hull, 1)
+    # Laser emitter turret
+    laser_c = P['laser_r'] if team == PLAYER else P['laser_g']
+    pygame.draw.circle(surf, dk2, (x, y), 9)
+    pygame.draw.circle(surf, laser_c, (x, y), 6)
+    # Barrel (thinner, more precise looking)
+    bx = int(x + math.cos(turret) * 22)
+    by = int(y + math.sin(turret) * 22)
+    pygame.draw.line(surf, (200, 200, 200), (x, y), (bx, by), 3)
+    pygame.draw.line(surf, laser_c, (x, y), (bx, by), 1)
+    # Glow at barrel tip
+    tip_a = int(100 + 60 * math.sin(pulse * 8))
+    ts = _get_surf(10, 10)
+    pygame.draw.circle(ts, (*laser_c[:3], tip_a), (5, 5), 4)
+    surf.blit(ts, (bx - 5, by - 5), special_flags=pygame.BLEND_ADD)
+
+
+# ── Flame Tank ────────────────────────────────────────────────────────────────
+def _draw_flame_tank(surf, x, y, team, facing, turret, selected, pulse):
+    c   = P['player'] if team == PLAYER else P['enemy']
+    dk  = _darker(c, 70)
+    dk2 = _darker(c, 40)
+    # Shadow
+    sh = _get_surf(40, 16)
+    pygame.draw.ellipse(sh, (0, 0, 0, 55), (0, 0, 40, 16))
+    surf.blit(sh, (x - 20, y + 8))
+    if selected:
+        _glow(surf, x, y, P['select'], 28, int(80 + 40 * math.sin(pulse * 6)))
+        pygame.draw.circle(surf, P['select'], (x, y), 20, 2)
+    # Treads (wider)
+    for sign in (-1, 1):
+        ox = math.cos(facing + math.pi / 2) * 13 * sign
+        oy = math.sin(facing + math.pi / 2) * 13 * sign
+        tread = _rot_rect(x + ox, y + oy, 30, 9, facing)
+        pygame.draw.polygon(surf, (35, 35, 35), tread)
+        pygame.draw.polygon(surf, (60, 60, 60), tread, 1)
+    # Chunky hull
+    hull = _rot_rect(x, y, 28, 20, facing)
+    pygame.draw.polygon(surf, dk, hull)
+    pygame.draw.polygon(surf, dk2, hull, 1)
+    # Fuel tank on back
+    bk = facing + math.pi
+    ftx = int(x + math.cos(bk) * 10)
+    fty = int(y + math.sin(bk) * 10)
+    pygame.draw.circle(surf, (80, 60, 30), (ftx, fty), 6)
+    pygame.draw.circle(surf, (100, 80, 40), (ftx, fty), 6, 1)
+    # Flamer nozzle (wide)
+    pygame.draw.circle(surf, dk2, (x, y), 8)
+    pygame.draw.circle(surf, P['flame'], (x, y), 5)
+    bx = int(x + math.cos(turret) * 18)
+    by = int(y + math.sin(turret) * 18)
+    pygame.draw.line(surf, (160, 140, 100), (x, y), (bx, by), 5)
+    pygame.draw.line(surf, (200, 160, 80), (x, y), (bx, by), 3)
+    # Flame tip pilot light
+    fx2 = int(x + math.cos(turret) * 20)
+    fy2 = int(y + math.sin(turret) * 20)
+    flicker = int(180 + 75 * math.sin(pulse * 15))
+    fs = _get_surf(10, 10)
+    pygame.draw.circle(fs, (*P['flame_hi'][:3], flicker), (5, 5), 4)
+    surf.blit(fs, (fx2 - 5, fy2 - 5), special_flags=pygame.BLEND_ADD)
+
+
+_DRAWERS = {
+    'infantry':     _draw_infantry,
+    'buggy':        _draw_buggy,
+    'tank':         _draw_tank,
+    'rocket_tank':  _draw_rocket_tank,
+    'tesla_tank':   _draw_tesla_tank,
+    'laser_tank':   _draw_laser_tank,
+    'flame_tank':   _draw_flame_tank,
+    'harvester':    _draw_harvester,
+    'mcv':          _draw_mcv,
+}
+
+
+# ── Building drawing ──────────────────────────────────────────────────────────
+def _draw_building(surf, x, y, bd, team, hp_ratio, time, selected, uc_ratio=None):
+    cx, cy = x + bd.w // 2, y + bd.h // 2
+    c  = P['player'] if team == PLAYER else P['enemy']
+    dk = _darker(c, 60)
+
+    if selected:
+        _glow(surf, cx, cy, P['select'], max(bd.w, bd.h) // 2 + 12)
+
+    kind = bd.kind
+
+    if kind == 'base':
+        _draw_base(surf, x, y, bd.w, bd.h, c, dk, time)
+    elif kind == 'barracks':
+        _draw_barracks(surf, x, y, bd.w, bd.h, c, dk)
+    elif kind == 'factory':
+        _draw_factory(surf, x, y, bd.w, bd.h, c, dk, time)
+    elif kind == 'refinery':
+        _draw_refinery(surf, x, y, bd.w, bd.h, c, dk)
+    elif kind == 'turret':
+        _draw_turret(surf, cx, cy, c, dk, time)
+    elif kind == 'wall':
+        _draw_wall(surf, x, y, bd.w, bd.h, c, dk)
+    elif kind == 'power_plant':
+        _draw_power_plant(surf, x, y, bd.w, bd.h, c, dk, time)
+
+    # Construction overlay
+    if uc_ratio is not None and uc_ratio < 1.0:
+        overlay = _get_surf(bd.w, bd.h)
+        overlay.fill((0, 0, 0, int(100 * (1 - uc_ratio))))
+        surf.blit(overlay, (x, y))
+        # Progress bar
+        pw = int(bd.w * uc_ratio)
+        pygame.draw.rect(surf, (0, 0, 0),          (x, y + bd.h + 2, bd.w, 5))
+        pygame.draw.rect(surf, P['ui_hi'],          (x, y + bd.h + 2, pw, 5))
+        return   # skip health bar while under construction
+
+    # Health bar
+    _hp_bar(surf, x + bd.w // 2, y - 8, bd.w, hp_ratio)
+
+
+def _draw_base(surf, x, y, w, h, c, dk, t):
+    cx, cy = x + w // 2, y + h // 2
+    dk2 = _darker(c, 30)
+    hi  = _lighter(c, 40)
+    hi2 = _lighter(c, 70)
+
+    # ── Ground shadow (soft) ──
+    sh = _get_surf(w + 12, h + 12)
+    pygame.draw.ellipse(sh, (0, 0, 0, 40), (0, 4, w + 12, h + 8))
+    surf.blit(sh, (x - 6, y - 2))
+
+    # ── Concrete foundation ──
+    pygame.draw.rect(surf, (50, 50, 48), (x - 2, y - 2, w + 4, h + 4), 0, 3)
+    pygame.draw.rect(surf, (65, 65, 60), (x - 2, y - 2, w + 4, h + 4), 1, 3)
+
+    # ── Outer armoured shell ──
+    pygame.draw.rect(surf, dk, (x, y, w, h), 0, 2)
+    # Top-lit bevel (light from top-left)
+    pygame.draw.line(surf, hi, (x + 1, y), (x + w - 2, y), 2)
+    pygame.draw.line(surf, hi, (x, y + 1), (x, y + h - 2), 1)
+    pygame.draw.line(surf, _darker(dk, 30), (x + 1, y + h - 1), (x + w - 1, y + h - 1), 2)
+    pygame.draw.line(surf, _darker(dk, 20), (x + w - 1, y + 1), (x + w - 1, y + h - 2), 1)
+
+    # ── Armour panel lines ──
+    m = 6
+    pygame.draw.rect(surf, dk2, (x + m, y + m, w - m*2, h - m*2), 0, 2)
+    pygame.draw.rect(surf, c, (x + m, y + m, w - m*2, h - m*2), 1, 2)
+    # Horizontal panel seams
+    for py_ in range(y + m + 12, y + h - m, 14):
+        pygame.draw.line(surf, _darker(dk, 15), (x + m + 2, py_), (x + w - m - 2, py_), 1)
+    # Vertical panel seams
+    for px_ in range(x + m + 14, x + w - m, 16):
+        pygame.draw.line(surf, _darker(dk, 15), (px_, y + m + 2), (px_, y + h - m - 2), 1)
+
+    # ── Corner reinforcement plates ──
+    for ox, oy in ((0, 0), (w - 14, 0), (0, h - 14), (w - 14, h - 14)):
+        rx, ry = x + ox + 2, y + oy + 2
+        pygame.draw.rect(surf, dk2, (rx, ry, 12, 12), 0, 2)
+        pygame.draw.rect(surf, c, (rx, ry, 12, 12), 1, 2)
+        # Rivet dots
+        for rx2, ry2 in ((rx + 3, ry + 3), (rx + 9, ry + 3), (rx + 3, ry + 9), (rx + 9, ry + 9)):
+            pygame.draw.circle(surf, hi, (rx2, ry2), 1)
+
+    # ── Central command dome ──
+    # Dome shadow
+    pygame.draw.ellipse(surf, _darker(dk, 20), (cx - 18, cy - 16, 36, 32))
+    # Dome body
+    pygame.draw.ellipse(surf, dk2, (cx - 16, cy - 14, 32, 28))
+    pygame.draw.ellipse(surf, c, (cx - 16, cy - 14, 32, 28), 2)
+    # Dome highlight (specular)
+    pygame.draw.ellipse(surf, hi, (cx - 10, cy - 12, 16, 10))
+    pygame.draw.ellipse(surf, hi2, (cx - 6, cy - 11, 8, 5))
+
+    # ── Radar dish (animated rotation) ──
+    radar_a = t * 1.5
+    rdx = int(cx + math.cos(radar_a) * 10)
+    rdy = int(cy - 6 + math.sin(radar_a) * 5)
+    pygame.draw.line(surf, hi, (cx, cy - 6), (rdx, rdy), 2)
+    pygame.draw.circle(surf, hi2, (rdx, rdy), 3)
+    pygame.draw.circle(surf, c, (rdx, rdy), 3, 1)
+
+    # ── Antenna tower (left) ──
+    ax_, ay_ = x + 14, y + 6
+    pygame.draw.line(surf, (140, 140, 140), (ax_, ay_ + 20), (ax_, ay_), 2)
+    pygame.draw.line(surf, (160, 160, 160), (ax_, ay_), (ax_, ay_ - 8), 1)
+    # Blinking light
+    blink = int(t * 2.5) % 2
+    blink_c = (255, 60, 30) if blink else (180, 30, 15)
+    pygame.draw.circle(surf, blink_c, (ax_, ay_ - 8), 2)
+    if blink:
+        _glow(surf, ax_, ay_ - 8, (255, 60, 30), 6, 60)
+
+    # ── Antenna tower (right) ──
+    ax2 = x + w - 14
+    pygame.draw.line(surf, (140, 140, 140), (ax2, ay_ + 16), (ax2, ay_), 2)
+    pygame.draw.line(surf, (160, 160, 160), (ax2, ay_), (ax2, ay_ - 5), 1)
+    blink2 = (int(t * 2.5) + 1) % 2
+    blink_c2 = P['fire_hi'] if blink2 else dk2
+    pygame.draw.circle(surf, blink_c2, (ax2, ay_ - 5), 2)
+
+    # ── Corner defence turrets ──
+    for ox, oy in ((6, 6), (w - 6, 6), (6, h - 6), (w - 6, h - 6)):
+        tx_, ty_ = x + ox, y + oy
+        pygame.draw.circle(surf, _darker(dk, 20), (tx_, ty_), 7)
+        pygame.draw.circle(surf, dk2, (tx_, ty_), 6)
+        pygame.draw.circle(surf, c, (tx_, ty_), 6, 1)
+        # Mini barrel pointing outward
+        bdir = math.atan2(ty_ - cy, tx_ - cx)
+        bx_ = int(tx_ + math.cos(bdir) * 8)
+        by_ = int(ty_ + math.sin(bdir) * 8)
+        pygame.draw.line(surf, (160, 160, 160), (tx_, ty_), (bx_, by_), 2)
+
+    # ── Subtle ambient glow from dome ──
+    pulse_a = int(30 + 20 * math.sin(t * 2.0))
+    _glow(surf, cx, cy, c, 20, pulse_a)
+
+
+def _draw_barracks(surf, x, y, w, h, c, dk):
+    cx, cy = x + w // 2, y + h // 2
+    dk2 = _darker(c, 30)
+    hi  = _lighter(c, 35)
+    hi2 = _lighter(c, 60)
+
+    # ── Ground shadow ──
+    sh = _get_surf(w + 8, h + 8)
+    pygame.draw.ellipse(sh, (0, 0, 0, 35), (0, 4, w + 8, h + 6))
+    surf.blit(sh, (x - 4, y - 2))
+
+    # ── Foundation slab ──
+    pygame.draw.rect(surf, (55, 55, 50), (x - 1, y - 1, w + 2, h + 2), 0, 2)
+
+    # ── Main structure ──
+    pygame.draw.rect(surf, dk, (x, y, w, h), 0, 1)
+    # Top bevel highlight
+    pygame.draw.line(surf, hi, (x + 1, y), (x + w - 2, y), 2)
+    pygame.draw.line(surf, _darker(dk, 25), (x + 1, y + h - 1), (x + w - 2, y + h - 1), 2)
+
+    # ── Roof section (angled look) ──
+    roof_h = 10
+    # Dark roof stripe
+    pygame.draw.rect(surf, _darker(dk, 20), (x + 2, y + 2, w - 4, roof_h), 0, 1)
+    # Roof ridge highlight
+    pygame.draw.line(surf, hi, (x + 3, y + 2), (x + w - 3, y + 2), 1)
+    pygame.draw.line(surf, dk2, (x + 3, y + roof_h + 1), (x + w - 3, y + roof_h + 1), 1)
+    # Corrugated metal lines on roof
+    for rx in range(x + 6, x + w - 4, 5):
+        pygame.draw.line(surf, _darker(dk, 10), (rx, y + 3), (rx, y + roof_h), 1)
+
+    # ── Wall panels ──
+    panel_y = y + roof_h + 4
+    panel_h = h - roof_h - 24
+    pygame.draw.rect(surf, dk2, (x + 4, panel_y, w - 8, panel_h))
+    pygame.draw.rect(surf, c, (x + 4, panel_y, w - 8, panel_h), 1)
+
+    # ── Windows with frames and interior glow ──
+    win_w, win_h = 8, 7
+    win_y = panel_y + 3
+    window_positions = [(x + 7, win_y), (x + w - 7 - win_w, win_y)]
+    for wx_, wy_ in window_positions:
+        # Window recess
+        pygame.draw.rect(surf, (10, 10, 10), (wx_ - 1, wy_ - 1, win_w + 2, win_h + 2))
+        # Glass (slightly lit from inside)
+        pygame.draw.rect(surf, _lighter(c, 80), (wx_, wy_, win_w, win_h))
+        # Glass cross frame
+        pygame.draw.line(surf, dk, (wx_ + win_w // 2, wy_), (wx_ + win_w // 2, wy_ + win_h), 1)
+        pygame.draw.line(surf, dk, (wx_, wy_ + win_h // 2), (wx_ + win_w, wy_ + win_h // 2), 1)
+        # Frame
+        pygame.draw.rect(surf, c, (wx_, wy_, win_w, win_h), 1)
+        # Interior warm glow
+        gs = _get_surf(win_w + 4, win_h + 4)
+        pygame.draw.rect(gs, (*_lighter(c, 100)[:3], 30), (0, 0, win_w + 4, win_h + 4))
+        surf.blit(gs, (wx_ - 2, wy_ - 2), special_flags=pygame.BLEND_ADD)
+
+    # ── Main door with steel frame ──
+    dw, dh_ = 14, 18
+    dx_ = x + w // 2 - dw // 2
+    dy_ = y + h - dh_
+    # Door recess shadow
+    pygame.draw.rect(surf, (3, 3, 3), (dx_ - 1, dy_ - 1, dw + 2, dh_ + 1))
+    # Door
+    pygame.draw.rect(surf, (25, 25, 25), (dx_, dy_, dw, dh_))
+    # Door vertical split
+    pygame.draw.line(surf, (35, 35, 35), (dx_ + dw // 2, dy_), (dx_ + dw // 2, dy_ + dh_), 1)
+    # Door frame
+    pygame.draw.rect(surf, c, (dx_ - 1, dy_ - 1, dw + 2, dh_ + 1), 1)
+    # Door handle
+    pygame.draw.circle(surf, (140, 140, 140), (dx_ + dw // 2 + 3, dy_ + dh_ // 2), 1)
+    # Step
+    pygame.draw.rect(surf, (70, 70, 65), (dx_ - 2, y + h - 2, dw + 4, 2))
+
+    # ── Sandbag bunker (left side) ──
+    for si, sy_ in enumerate(range(y + h - 6, y + h - 2, 3)):
+        sw_ = 10 - si * 2
+        sbx = x - 3 + si
+        pygame.draw.ellipse(surf, (100, 90, 65), (sbx, sy_, sw_, 4))
+        pygame.draw.ellipse(surf, (80, 70, 50), (sbx, sy_, sw_, 4), 1)
+
+    # ── Star / military insignia on wall ──
+    pygame.draw.circle(surf, c, (cx, panel_y + panel_h // 2 + 1), 4, 1)
+    pygame.draw.circle(surf, hi, (cx, panel_y + panel_h // 2 + 1), 2)
+
+    # ── Outer border ──
+    pygame.draw.rect(surf, c, (x, y, w, h), 2, 1)
+
+
+def _draw_factory(surf, x, y, w, h, c, dk, t):
+    cx, cy = x + w // 2, y + h // 2
+    dk2 = _darker(c, 30)
+    hi  = _lighter(c, 35)
+    hi2 = _lighter(c, 60)
+
+    # ── Ground shadow ──
+    sh = _get_surf(w + 10, h + 10)
+    pygame.draw.ellipse(sh, (0, 0, 0, 38), (0, 4, w + 10, h + 8))
+    surf.blit(sh, (x - 5, y - 2))
+
+    # ── Concrete pad ──
+    pygame.draw.rect(surf, (55, 55, 50), (x - 2, y - 2, w + 4, h + 4), 0, 2)
+    pygame.draw.rect(surf, (65, 65, 58), (x - 2, y - 2, w + 4, h + 4), 1, 2)
+
+    # ── Main industrial shell ──
+    pygame.draw.rect(surf, dk, (x, y, w, h), 0, 2)
+    # Top bevel
+    pygame.draw.line(surf, hi, (x + 1, y), (x + w - 2, y), 2)
+    pygame.draw.line(surf, _darker(dk, 30), (x + 1, y + h - 1), (x + w - 1, y + h - 1), 2)
+    pygame.draw.line(surf, _darker(dk, 20), (x + w - 1, y + 1), (x + w - 1, y + h - 1), 1)
+
+    # ── Horizontal panel seams ──
+    for py_ in (y + 14, y + h // 2, y + h - 14):
+        pygame.draw.line(surf, _darker(dk, 12), (x + 3, py_), (x + w - 3, py_), 1)
+
+    # ── Chimney / exhaust stack (left side) ──
+    stack_x, stack_w = x + 5, 10
+    stack_top = y - 10
+    # Stack body
+    pygame.draw.rect(surf, (60, 60, 55), (stack_x, stack_top, stack_w, y - stack_top + 12))
+    pygame.draw.rect(surf, (75, 75, 70), (stack_x, stack_top, stack_w, y - stack_top + 12), 1)
+    # Metal bands
+    for by_ in (stack_top + 3, stack_top + 8):
+        pygame.draw.line(surf, (90, 90, 85), (stack_x, by_), (stack_x + stack_w, by_), 1)
+    # Smoke cap
+    pygame.draw.rect(surf, (80, 80, 75), (stack_x - 1, stack_top - 2, stack_w + 2, 3))
+    # Animated smoke puffs
+    for i in range(3):
+        smoke_y = stack_top - 6 - i * 7
+        smoke_x = stack_x + stack_w // 2 + int(math.sin(t * 1.2 + i * 1.8) * 4)
+        smoke_r = 3 + i * 2
+        smoke_a = max(10, 60 - i * 20)
+        ss = _get_surf(smoke_r * 2 + 4, smoke_r * 2 + 4)
+        pygame.draw.circle(ss, (110, 115, 110, smoke_a), (smoke_r + 2, smoke_r + 2), smoke_r)
+        surf.blit(ss, (smoke_x - smoke_r - 2, smoke_y - smoke_r - 2))
+
+    # ── Assembly area (inner panel) ──
+    ax_, ay_ = x + 18, y + 6
+    aw, ah_ = w - 24, h - 32
+    pygame.draw.rect(surf, _darker(dk, 15), (ax_, ay_, aw, ah_), 0, 1)
+    pygame.draw.rect(surf, dk2, (ax_, ay_, aw, ah_), 1, 1)
+    # Conveyor belt lines (animated)
+    belt_off = int(t * 40) % 8
+    for by_ in range(ay_ + 4 + belt_off, ay_ + ah_ - 2, 8):
+        pygame.draw.line(surf, _darker(dk, 8), (ax_ + 3, by_), (ax_ + aw - 3, by_), 1)
+
+    # ── Gantry crane rail (top) ──
+    rail_y = ay_ + 2
+    pygame.draw.line(surf, (100, 100, 95), (ax_ + 2, rail_y), (ax_ + aw - 2, rail_y), 2)
+    # Crane trolley (animated position)
+    crane_x = int(ax_ + 6 + (aw - 12) * (0.5 + 0.5 * math.sin(t * 0.4)))
+    pygame.draw.rect(surf, (120, 120, 115), (crane_x - 4, rail_y - 1, 8, 4))
+    # Crane cable
+    pygame.draw.line(surf, (90, 90, 90), (crane_x, rail_y + 3), (crane_x, rail_y + ah_ // 2), 1)
+    # Hook
+    pygame.draw.circle(surf, (140, 140, 135), (crane_x, rail_y + ah_ // 2), 2, 1)
+
+    # ── Large vehicle bay door ──
+    door_w, door_h = 28, 22
+    dx_ = x + w // 2 - door_w // 2
+    dy_ = y + h - door_h
+    # Door recess
+    pygame.draw.rect(surf, (8, 8, 8), (dx_ - 1, dy_ - 1, door_w + 2, door_h + 2))
+    # Roller door segments
+    door_phase = math.sin(t * 0.5) * 0.5 + 0.5  # 0-1 open/close
+    visible_h = int(door_h * (1.0 - door_phase * 0.6))
+    if visible_h > 0:
+        pygame.draw.rect(surf, (40, 40, 38), (dx_, dy_, door_w, visible_h))
+        # Horizontal segments
+        for seg_y in range(dy_ + 3, dy_ + visible_h - 1, 4):
+            pygame.draw.line(surf, (55, 55, 50), (dx_ + 1, seg_y), (dx_ + door_w - 1, seg_y), 1)
+    # Interior darkness below door
+    if visible_h < door_h:
+        pygame.draw.rect(surf, (5, 5, 5), (dx_, dy_ + visible_h, door_w, door_h - visible_h))
+    # Door frame
+    pygame.draw.rect(surf, c, (dx_ - 1, dy_ - 1, door_w + 2, door_h + 2), 1)
+    # Warning stripes on door sides
+    for si in range(0, door_h, 6):
+        stripe_c = (200, 180, 0) if (si // 3) % 2 == 0 else (30, 30, 30)
+        pygame.draw.rect(surf, stripe_c, (dx_ - 3, dy_ + si, 2, min(3, door_h - si)))
+        pygame.draw.rect(surf, stripe_c, (dx_ + door_w + 1, dy_ + si, 2, min(3, door_h - si)))
+
+    # ── Status light ──
+    light_c = (0, 200, 60) if door_phase > 0.3 else (200, 60, 0)
+    pygame.draw.circle(surf, light_c, (dx_ + door_w + 5, dy_ - 3), 2)
+    if door_phase > 0.3:
+        _glow(surf, dx_ + door_w + 5, dy_ - 3, light_c, 5, 40)
+
+    # ── Outer border ──
+    pygame.draw.rect(surf, c, (x, y, w, h), 2, 2)
+
+
+def _draw_refinery(surf, x, y, w, h, c, dk):
+    cx, cy = x + w // 2, y + h // 2
+    dk2 = _darker(c, 30)
+    hi  = _lighter(c, 35)
+
+    # ── Ground shadow ──
+    sh = _get_surf(w + 8, h + 8)
+    pygame.draw.ellipse(sh, (0, 0, 0, 35), (0, 4, w + 8, h + 6))
+    surf.blit(sh, (x - 4, y - 2))
+
+    # ── Concrete pad ──
+    pygame.draw.rect(surf, (52, 52, 48), (x - 1, y - 1, w + 2, h + 2), 0, 3)
+
+    # ── Main structure ──
+    pygame.draw.rect(surf, dk, (x, y, w, h), 0, 4)
+    # Bevel highlights
+    pygame.draw.line(surf, hi, (x + 2, y), (x + w - 3, y), 2)
+    pygame.draw.line(surf, _darker(dk, 25), (x + 2, y + h - 1), (x + w - 3, y + h - 1), 2)
+
+    # ── Processing module (left half) ──
+    pm_x, pm_y = x + 4, y + 4
+    pm_w, pm_h = w // 2 - 4, h - 8
+    pygame.draw.rect(surf, dk2, (pm_x, pm_y, pm_w, pm_h), 0, 2)
+    pygame.draw.rect(surf, c, (pm_x, pm_y, pm_w, pm_h), 1, 2)
+    # Processing grates
+    for gy_ in range(pm_y + 4, pm_y + pm_h - 2, 5):
+        pygame.draw.line(surf, _darker(dk, 15), (pm_x + 3, gy_), (pm_x + pm_w - 3, gy_), 1)
+    # Tiberium intake hopper
+    hopper_y = pm_y + pm_h - 12
+    pygame.draw.rect(surf, (20, 80, 30), (pm_x + 2, hopper_y, pm_w - 4, 10), 0, 1)
+    pygame.draw.rect(surf, P['tib'], (pm_x + 2, hopper_y, pm_w - 4, 10), 1, 1)
+    # Green glow in hopper
+    gs = _get_surf(pm_w, 14)
+    pygame.draw.rect(gs, (*P['tib'][:3], 40), (0, 0, pm_w, 14))
+    surf.blit(gs, (pm_x, hopper_y - 2), special_flags=pygame.BLEND_ADD)
+
+    # ── Storage tank (right side, large cylinder) ──
+    tank_cx = x + w - 18
+    tank_cy = cy
+    tank_r = 15
+    # Tank shadow (elliptical, 3D effect)
+    pygame.draw.ellipse(surf, _darker(dk, 30), (tank_cx - tank_r - 1, tank_cy - tank_r - 1, tank_r * 2 + 2, tank_r * 2 + 2))
+    # Tank body (gradient simulation: dark left, bright right)
+    pygame.draw.circle(surf, _darker(c, 40), (tank_cx, tank_cy), tank_r)
+    pygame.draw.circle(surf, dk2, (tank_cx, tank_cy), tank_r - 2)
+    # Tank highlight arc (simulates cylindrical shape)
+    pygame.draw.arc(surf, hi, (tank_cx - tank_r + 2, tank_cy - tank_r + 2, tank_r * 2 - 4, tank_r * 2 - 4),
+                    math.radians(200), math.radians(340), 2)
+    # Tiberium fill level
+    pygame.draw.circle(surf, P['tib'], (tank_cx, tank_cy), tank_r - 5)
+    pygame.draw.circle(surf, P['tib_hi'], (tank_cx, tank_cy), tank_r - 9)
+    # Tank specular highlight
+    pygame.draw.circle(surf, _lighter(P['tib_hi'], 40), (tank_cx - 3, tank_cy - 4), 3)
+    # Tank rim
+    pygame.draw.circle(surf, c, (tank_cx, tank_cy), tank_r, 2)
+    # Level indicator marks
+    for mi in range(-tank_r + 4, tank_r - 3, 5):
+        pygame.draw.line(surf, c, (tank_cx + tank_r - 2, tank_cy + mi), (tank_cx + tank_r + 1, tank_cy + mi), 1)
+
+    # ── Connecting pipes ──
+    pipe_y1 = cy - 5
+    pipe_y2 = cy + 5
+    pipe_sx = pm_x + pm_w
+    pipe_ex = tank_cx - tank_r
+    for py_ in (pipe_y1, pipe_y2):
+        pygame.draw.line(surf, (90, 90, 85), (pipe_sx, py_), (pipe_ex, py_), 3)
+        pygame.draw.line(surf, (110, 110, 105), (pipe_sx, py_ - 1), (pipe_ex, py_ - 1), 1)
+    # Pipe joints
+    for jx in (pipe_sx + 2, pipe_ex - 2):
+        for py_ in (pipe_y1, pipe_y2):
+            pygame.draw.circle(surf, (100, 100, 95), (jx, py_), 3)
+            pygame.draw.circle(surf, (75, 75, 70), (jx, py_), 3, 1)
+    # Valve on upper pipe
+    vx = (pipe_sx + pipe_ex) // 2
+    pygame.draw.circle(surf, (120, 40, 40), (vx, pipe_y1), 3)
+    pygame.draw.circle(surf, (150, 60, 60), (vx, pipe_y1), 3, 1)
+
+    # ── Unloading bay (bottom) ──
+    bay_w = 20
+    bay_x = x + 8
+    bay_y = y + h - 6
+    pygame.draw.rect(surf, (40, 40, 38), (bay_x, bay_y, bay_w, 6), 0, 1)
+    pygame.draw.rect(surf, c, (bay_x, bay_y, bay_w, 6), 1, 1)
+    # Landing pad markers
+    for lx in (bay_x + 3, bay_x + bay_w - 5):
+        pygame.draw.rect(surf, (200, 180, 0), (lx, bay_y + 1, 3, 4))
+
+    # ── Outer border ──
+    pygame.draw.rect(surf, c, (x, y, w, h), 2, 4)
+
+
+def _draw_turret(surf, cx, cy, c, dk, t):
+    dk2 = _darker(c, 30)
+    hi  = _lighter(c, 35)
+    hi2 = _lighter(c, 60)
+
+    # ── Ground shadow ──
+    sh = _get_surf(40, 20)
+    pygame.draw.ellipse(sh, (0, 0, 0, 40), (0, 6, 40, 16))
+    surf.blit(sh, (cx - 20, cy - 6))
+
+    # ── Concrete base pad (octagonal look) ──
+    pad_r = 17
+    pad_pts = [(cx + _OCT_OFFSETS[i][0], cy + _OCT_OFFSETS[i][1]) for i in range(8)]
+    pygame.draw.polygon(surf, (55, 55, 50), pad_pts)
+    pygame.draw.polygon(surf, (70, 70, 65), pad_pts, 2)
+
+    # ── Turret platform (raised square) ──
+    pygame.draw.rect(surf, dk, (cx - 14, cy - 14, 28, 28), 0, 3)
+    pygame.draw.line(surf, hi, (cx - 13, cy - 14), (cx + 13, cy - 14), 2)
+    pygame.draw.line(surf, _darker(dk, 20), (cx - 13, cy + 13), (cx + 13, cy + 13), 2)
+    pygame.draw.rect(surf, c, (cx - 14, cy - 14, 28, 28), 2, 3)
+
+    # ── Inner turret ring ──
+    pygame.draw.circle(surf, _darker(dk, 15), (cx, cy), 12)
+    pygame.draw.circle(surf, dk2, (cx, cy), 11)
+    pygame.draw.circle(surf, c, (cx, cy), 11, 2)
+
+    # ── Turret dome ──
+    pygame.draw.circle(surf, dk2, (cx, cy), 9)
+    pygame.draw.circle(surf, c, (cx, cy), 8)
+    # Dome specular highlight
+    pygame.draw.circle(surf, hi, (cx - 2, cy - 3), 4)
+    pygame.draw.circle(surf, hi2, (cx - 2, cy - 3), 2)
+
+    # ── Rotating barrel ──
+    angle = t * 0.8
+    barrel_len = 20
+    bx = int(cx + math.cos(angle) * barrel_len)
+    by = int(cy + math.sin(angle) * barrel_len)
+    # Barrel shadow
+    bsx = int(cx + math.cos(angle) * (barrel_len + 2))
+    bsy = int(cy + math.sin(angle) * (barrel_len + 2)) + 2
+    pygame.draw.line(surf, (30, 30, 30), (cx, cy + 2), (bsx, bsy), 4)
+    # Barrel body
+    pygame.draw.line(surf, (120, 120, 115), (cx, cy), (bx, by), 5)
+    pygame.draw.line(surf, (160, 160, 155), (cx, cy), (bx, by), 3)
+    pygame.draw.line(surf, (180, 180, 175), (cx, cy), (bx, by), 1)
+    # Muzzle brake
+    mx = int(cx + math.cos(angle) * (barrel_len - 2))
+    my = int(cy + math.sin(angle) * (barrel_len - 2))
+    perp = angle + math.pi / 2
+    for sign in (-1, 1):
+        mpx = int(mx + math.cos(perp) * 4 * sign)
+        mpy = int(my + math.sin(perp) * 4 * sign)
+        pygame.draw.line(surf, (140, 140, 135), (mx, my), (mpx, mpy), 2)
+
+    # ── Bolt details on platform corners ──
+    for ox, oy in ((-11, -11), (11, -11), (-11, 11), (11, 11)):
+        pygame.draw.circle(surf, hi, (cx + ox, cy + oy), 1)
+
+
+def _draw_wall(surf, x, y, w, h, c, dk):
+    # ── Stone/concrete colours ──
+    stone     = (95, 95, 88)
+    stone_dk  = (58, 58, 54)
+    stone_hi  = (125, 123, 116)
+    stone_mid = (78, 78, 72)
+
+    # ── Drop shadow ──
+    sh = _get_surf(w + 4, h + 6)
+    pygame.draw.rect(sh, (0, 0, 0, 45), (2, 3, w + 2, h + 2))
+    surf.blit(sh, (x - 1, y))
+
+    # ── Main wall body ──
+    pygame.draw.rect(surf, stone_dk, (x, y, w, h))
+
+    # ── Brick pattern ──
+    brick_h = h // 4
+    for row_i in range(4):
+        ry = y + row_i * brick_h
+        # Each row is offset
+        offset = (w // 3) if row_i % 2 else 0
+        for bx_ in range(-offset, w, w // 2):
+            real_bx = x + max(0, bx_)
+            real_ex = x + min(w, bx_ + w // 2)
+            if real_ex <= real_bx:
+                continue
+            bw_ = real_ex - real_bx
+            # Slight colour variation per brick
+            shade = ((row_i * 7 + bx_ * 3) % 12) - 6
+            bc = (stone[0] + shade, stone[1] + shade, stone[2] + shade - 2)
+            bc = tuple(max(0, min(255, v)) for v in bc)
+            pygame.draw.rect(surf, bc, (real_bx + 1, ry + 1, bw_ - 1, brick_h - 1))
+
+    # ── Mortar lines (horizontal) ──
+    for row_i in range(1, 4):
+        my = y + row_i * brick_h
+        pygame.draw.line(surf, stone_dk, (x + 1, my), (x + w - 1, my), 1)
+
+    # ── Mortar lines (vertical, staggered) ──
+    for row_i in range(4):
+        ry = y + row_i * brick_h
+        offset = (w // 3) if row_i % 2 else 0
+        for bx_ in range(-offset, w, w // 2):
+            vx = x + bx_ + w // 2
+            if x < vx < x + w:
+                pygame.draw.line(surf, stone_dk, (vx, ry + 1), (vx, ry + brick_h - 1), 1)
+
+    # ── Top edge highlight (lit from above) ──
+    pygame.draw.line(surf, stone_hi, (x, y), (x + w - 1, y), 2)
+    # Left edge (slight highlight)
+    pygame.draw.line(surf, stone_mid, (x, y), (x, y + h - 1), 1)
+    # Bottom edge shadow
+    pygame.draw.line(surf, _darker(stone_dk, 15), (x, y + h - 1), (x + w - 1, y + h - 1), 1)
+    # Right edge shadow
+    pygame.draw.line(surf, _darker(stone_dk, 10), (x + w - 1, y), (x + w - 1, y + h - 1), 1)
+
+    # ── Subtle weathering crack ──
+    pygame.draw.line(surf, _darker(stone_dk, 8), (x + 5, y + 4), (x + w - 8, y + h - 5), 1)
+
+    # ── Border outline ──
+    pygame.draw.rect(surf, stone_dk, (x, y, w, h), 1)
+
+
+def _draw_power_plant(surf, x, y, w, h, c, dk, t):
+    cx, cy = x + w // 2, y + h // 2
+    dk2 = _darker(c, 30)
+    hi  = _lighter(c, 35)
+    hi2 = _lighter(c, 60)
+
+    # ── Ground shadow ──
+    sh = _get_surf(w + 10, h + 10)
+    pygame.draw.ellipse(sh, (0, 0, 0, 38), (0, 4, w + 10, h + 8))
+    surf.blit(sh, (x - 5, y - 2))
+
+    # ── Concrete foundation ──
+    pygame.draw.rect(surf, (52, 52, 48), (x - 1, y - 1, w + 2, h + 2), 0, 2)
+
+    # ── Main body ──
+    pygame.draw.rect(surf, dk, (x, y, w, h), 0, 2)
+    # Top bevel highlight
+    pygame.draw.line(surf, hi, (x + 1, y), (x + w - 2, y), 2)
+    pygame.draw.line(surf, _darker(dk, 25), (x + 1, y + h - 1), (x + w - 2, y + h - 1), 2)
+    # Side bevels
+    pygame.draw.line(surf, hi, (x, y + 1), (x, y + h - 2), 1)
+    pygame.draw.line(surf, _darker(dk, 15), (x + w - 1, y + 1), (x + w - 1, y + h - 2), 1)
+
+    # ── Panel seams ──
+    for py_ in range(y + 12, y + h - 6, 14):
+        pygame.draw.line(surf, _darker(dk, 10), (x + 3, py_), (x + w - 3, py_), 1)
+
+    # ── Cooling tower (left, large cylindrical) ──
+    tower_cx = x + 16
+    tower_cy = cy + 2
+    tower_r = 13
+    # Tower shadow
+    pygame.draw.ellipse(surf, _darker(dk, 25), (tower_cx - tower_r - 1, tower_cy - tower_r - 1,
+                                                  tower_r * 2 + 2, tower_r * 2 + 2))
+    # Tower body
+    pygame.draw.circle(surf, _darker(c, 45), (tower_cx, tower_cy), tower_r)
+    pygame.draw.circle(surf, _darker(c, 25), (tower_cx, tower_cy), tower_r - 2)
+    # Cylindrical highlight arc
+    pygame.draw.arc(surf, hi, (tower_cx - tower_r + 2, tower_cy - tower_r + 2,
+                                tower_r * 2 - 4, tower_r * 2 - 4),
+                    math.radians(200), math.radians(330), 2)
+    # Tower rim
+    pygame.draw.circle(surf, c, (tower_cx, tower_cy), tower_r, 2)
+    # Interior darkness (hollow top)
+    pygame.draw.circle(surf, _darker(dk, 40), (tower_cx, tower_cy), tower_r - 5)
+    # Horizontal band details
+    for br in (tower_r - 3, tower_r - 7):
+        pygame.draw.circle(surf, dk2, (tower_cx, tower_cy), br, 1)
+
+    # ── Steam vents (top of tower) ──
+    for i, vx in enumerate((tower_cx - 5, tower_cx + 3)):
+        # Animated steam puffs
+        for j in range(2):
+            sy_ = y - 2 - j * 6 - i * 3
+            sx_ = vx + int(math.sin(t * 1.5 + i * 2.0 + j * 1.3) * 3)
+            sr = 3 + j
+            sa = max(10, 50 - j * 25)
+            ss = _get_surf(sr * 2 + 2, sr * 2 + 2)
+            pygame.draw.circle(ss, (160, 165, 160, sa), (sr + 1, sr + 1), sr)
+            surf.blit(ss, (sx_ - sr - 1, sy_ - sr - 1))
+        # Vent caps
+        pygame.draw.circle(surf, (140, 140, 135), (vx, y + 3), 4)
+        pygame.draw.circle(surf, (100, 100, 95), (vx, y + 3), 4, 1)
+
+    # ── Reactor core (right side) ──
+    core_cx = cx + 12
+    core_cy = cy
+    # Core housing
+    pygame.draw.rect(surf, _darker(dk, 15), (core_cx - 10, core_cy - 12, 20, 24), 0, 3)
+    pygame.draw.rect(surf, c, (core_cx - 10, core_cy - 12, 20, 24), 1, 3)
+
+    # Pulsing energy core
+    pulse = math.sin(t * 3.0)
+    pulse_r = int(6 + 2 * pulse)
+    core_alpha = int(120 + 80 * pulse)
+    # Core glow (layered)
+    _glow(surf, core_cx, core_cy, (255, 255, 100), 14, int(40 + 30 * pulse))
+    # Core bright center
+    cs = _get_surf(pulse_r * 2 + 8, pulse_r * 2 + 8)
+    pygame.draw.circle(cs, (255, 255, 80, core_alpha), (pulse_r + 4, pulse_r + 4), pulse_r + 2)
+    pygame.draw.circle(cs, (255, 255, 180, min(255, core_alpha + 40)), (pulse_r + 4, pulse_r + 4), pulse_r)
+    surf.blit(cs, (core_cx - pulse_r - 4, core_cy - pulse_r - 4), special_flags=pygame.BLEND_ADD)
+    pygame.draw.circle(surf, (255, 255, 200), (core_cx, core_cy), 3)
+
+    # ── Lightning bolt symbol on housing ──
+    bx_, by_ = core_cx - 2, core_cy - 9
+    bolt_pts = [(bx_ + 2, by_), (bx_ - 1, by_ + 6), (bx_ + 3, by_ + 6),
+                (bx_, by_ + 13)]
+    pygame.draw.lines(surf, (255, 230, 0), False, bolt_pts, 2)
+    # Bright inner bolt
+    pygame.draw.lines(surf, (255, 255, 150), False, bolt_pts, 1)
+
+    # ── Power conduit pipes ──
+    pipe_y = cy + 8
+    pygame.draw.line(surf, (90, 90, 85), (tower_cx + tower_r, pipe_y), (core_cx - 10, pipe_y), 3)
+    pygame.draw.line(surf, (110, 110, 105), (tower_cx + tower_r, pipe_y - 1), (core_cx - 10, pipe_y - 1), 1)
+
+    # ── Energy arc effect (occasional) ──
+    arc_phase = math.sin(t * 5.0)
+    if arc_phase > 0.7:
+        arc_alpha = int((arc_phase - 0.7) / 0.3 * 120)
+        for _ in range(2):
+            aa = random.uniform(0, math.tau)
+            ar = random.uniform(8, 16)
+            aex = int(core_cx + math.cos(aa) * ar)
+            aey = int(core_cy + math.sin(aa) * ar)
+            as_ = _get_surf(4, 4)
+            pygame.draw.line(as_, (200, 240, 255, arc_alpha), (0, 0), (3, 3), 1)
+            surf.blit(as_, (min(aex, core_cx) - 1, min(aey, core_cy) - 1), special_flags=pygame.BLEND_ADD)
+            pygame.draw.line(surf, (180, 220, 255), (core_cx, core_cy), (aex, aey), 1)
+
+    # ── Status indicator lights ──
+    for i, lx in enumerate((x + 4, x + 10)):
+        lc = (0, 200, 60) if (int(t * 1.5) + i) % 3 != 0 else (200, 60, 0)
+        pygame.draw.circle(surf, lc, (lx, y + h - 5), 2)
+
+    # ── Outer border ──
+    pygame.draw.rect(surf, c, (x, y, w, h), 2, 2)
+
+
+# ── Tiberium ──────────────────────────────────────────────────────────────────
+def _draw_tiberium(surf, x, y, ratio, t):
+    n = max(2, int(9 * ratio))
+    pulse = 0.5 + 0.5 * math.sin(t * 2.0 + x * 0.02 + y * 0.03)
+    for i in range(n):
+        angle = i * 0.72 + (i % 3) * 0.4
+        dist  = 3 + (i % 4) * 5
+        # Crystal dimensions: taller, more varied
+        h   = 5 + (i % 4) * 3 + int(2 * ratio)
+        hw  = max(2, h // 3 + (i % 2))
+        # Gentle sway
+        sway = math.sin(t * 1.5 + i * 1.1) * 1.2
+        cx = int(x + math.cos(angle) * dist * ratio + sway)
+        cy = int(y + math.sin(angle) * dist * ratio)
+        # Crystal: hexagonal prism shape (6-point)
+        tip_y = cy - h
+        base_y = cy + 2
+        mid_y = cy - h // 3
+        pts = [
+            (cx, tip_y),                   # top point
+            (cx + hw, mid_y),              # upper right
+            (cx + hw - 1, base_y),         # lower right
+            (cx, base_y + 1),              # bottom center
+            (cx - hw + 1, base_y),         # lower left
+            (cx - hw, mid_y),              # upper left
+        ]
+        # Darker fill for body
+        body_c = (15 + (i * 7) % 15, 140 + (i * 11) % 50, 30 + (i * 5) % 20)
+        pygame.draw.polygon(surf, body_c, pts)
+        # Edge highlight (brighter on right face = light direction)
+        pygame.draw.line(surf, P['tib_hi'], (cx, tip_y), (cx + hw, mid_y), 1)
+        pygame.draw.line(surf, P['tib_hi'], (cx + hw, mid_y), (cx + hw - 1, base_y), 1)
+        # Left edge darker
+        edge_dk = _darker(body_c, 25)
+        pygame.draw.line(surf, edge_dk, (cx, tip_y), (cx - hw, mid_y), 1)
+        pygame.draw.line(surf, edge_dk, (cx - hw, mid_y), (cx - hw + 1, base_y), 1)
+        # Specular highlight dot near tip
+        spec_pulse = 0.6 + 0.4 * math.sin(t * 3.0 + i * 2.3)
+        if spec_pulse > 0.7:
+            pygame.draw.circle(surf, (180, 255, 180), (cx, tip_y + 2), 1)
+        # Inner vein line (center of crystal)
+        if h >= 8:
+            vein_c = (40, 220, 70, 120)
+            pygame.draw.line(surf, P['tib_hi'], (cx, tip_y + 2), (cx, base_y - 1), 1)
+
+
+# ── Health bar ────────────────────────────────────────────────────────────────
+def _hp_bar(surf, cx, y, w, ratio):
+    bw = max(24, w)
+    bx = cx - bw // 2
+    pygame.draw.rect(surf, (0, 0, 0),   (bx, y, bw, 5))
+    if   ratio > 0.6: col = P['hp_hi']
+    elif ratio > 0.3: col = P['hp_mid']
+    else:             col = P['hp_lo']
+    pygame.draw.rect(surf, col, (bx, y, int(bw * ratio), 5))
+    pygame.draw.rect(surf, P['gray'], (bx, y, bw, 5), 1)
+
+
+# ── Projectile ────────────────────────────────────────────────────────────────
+def _draw_projectile(surf, pos, proj):
+    c = P['proj_p'] if proj.team == PLAYER else P['proj_e']
+    ix, iy = int(pos.x), int(pos.y)
+    # Direction for comet tail
+    dx = proj.tx - pos.x
+    dy = proj.ty - pos.y
+    d = max(1, math.hypot(dx, dy))
+    nx, ny = dx / d, dy / d
+    # Outer glow (big)
+    _glow(surf, ix, iy, c, 14, 100)
+    # Hot core
+    pygame.draw.circle(surf, (255, 255, 255), (ix, iy), 3)
+    pygame.draw.circle(surf, c, (ix, iy), 4, 1)
+    # Comet tail (3 fading circles behind projectile)
+    for i in range(1, 4):
+        tx = int(pos.x - nx * i * 6)
+        ty = int(pos.y - ny * i * 6)
+        a = max(0, 160 - i * 50)
+        r = max(1, 4 - i)
+        ts = _get_surf(r * 2 + 2, r * 2 + 2)
+        pygame.draw.circle(ts, (*c[:3], a), (r + 1, r + 1), r)
+        surf.blit(ts, (tx - r - 1, ty - r - 1))
+
+
+# ── Fog of war ────────────────────────────────────────────────────────────────
+def _draw_fog(surf, fog, cam_x, cam_y):
+    _ensure_surfaces()
+    tile_ox = int(cam_x) % TILE
+    tile_oy = int(cam_y) % TILE
+    tx0     = int(cam_x) // TILE
+    ty0     = int(cam_y) // TILE
+    cols    = W  // TILE + 2
+    rows    = (H - HUD_H) // TILE + 2
+
+    for drow in range(rows):
+        my = ty0 + drow
+        if not (0 <= my < MAP_H):
+            continue
+        for dcol in range(cols):
+            mx = tx0 + dcol
+            if not (0 <= mx < MAP_W):
+                continue
+            f  = fog[my, mx]
+            sx = dcol * TILE - tile_ox
+            sy = drow * TILE - tile_oy
+            if f == 0:
+                surf.blit(_fog_dark, (sx, sy))
+            elif f == 1:
+                surf.blit(_fog_dim,  (sx, sy))
+
+
+# ── HUD helpers ───────────────────────────────────────────────────────────────
+def _has_complete_bldg(world, kind: str) -> bool:
+    for eid, bd, t in world.q(BuildingData, Team):
+        if t.id == PLAYER and bd.kind == kind:
+            if not world.get(eid, UnderConstruction):
+                return True
+    return False
+
+
+def _draw_lock_icon(surf, x: int, y: int) -> None:
+    pygame.draw.arc(surf, P['gray'], (x, y, 9, 8), 0, math.pi, 2)
+    pygame.draw.rect(surf, P['gray'], (x, y + 5, 9, 7), 0, 1)
+
+
+def _draw_btn_icon(surf, cx: int, cy: int, kind: str) -> None:
+    """~44 × 26 programmatic icon centred at (cx, cy)."""
+    cu = (120, 185, 120)
+    cb = (110, 150, 200)
+    if kind == 'infantry':
+        pygame.draw.circle(surf, cu, (cx, cy - 9), 5)
+        pygame.draw.rect(surf, cu, (cx - 4, cy - 4, 8, 9))
+        pygame.draw.line(surf, (200, 200, 200), (cx + 3, cy - 6), (cx + 12, cy - 9), 2)
+    elif kind == 'buggy':
+        pygame.draw.rect(surf, cu, (cx - 14, cy - 5, 28, 10), 0, 2)
+        for wx in (cx - 9, cx + 9):
+            pygame.draw.circle(surf, (45, 45, 45),    (wx, cy + 6), 5)
+            pygame.draw.circle(surf, (100, 100, 100), (wx, cy + 6), 5, 1)
+        pygame.draw.line(surf, (200, 200, 200), (cx, cy - 1), (cx + 16, cy - 3), 2)
+    elif kind == 'tank':
+        pygame.draw.rect(surf, cu, (cx - 16, cy - 5, 32, 12), 0, 2)
+        pygame.draw.circle(surf, _lighter(cu, 30), (cx, cy - 1), 7)
+        pygame.draw.line(surf, (200, 200, 200), (cx, cy - 1), (cx + 18, cy - 4), 3)
+    elif kind == 'harvester':
+        pygame.draw.rect(surf, cu, (cx - 14, cy - 6, 28, 12), 0, 2)
+        pygame.draw.circle(surf, P['tib'],    (cx + 15, cy), 6)
+        pygame.draw.circle(surf, P['tib_hi'], (cx + 15, cy), 4)
+    elif kind == 'barracks':
+        pygame.draw.rect(surf, cb, (cx - 13, cy - 1, 26, 12), 0, 2)
+        pygame.draw.polygon(surf, _darker(cb, 25),
+                            [(cx - 15, cy - 1), (cx, cy - 11), (cx + 15, cy - 1)])
+        pygame.draw.rect(surf, (5, 5, 5), (cx - 4, cy + 5, 8, 6))
+    elif kind == 'factory':
+        pygame.draw.rect(surf, cb, (cx - 15, cy - 8, 30, 19), 0, 2)
+        pygame.draw.rect(surf, _darker(cb, 30), (cx - 12, cy - 8, 5, 16))
+        pygame.draw.rect(surf, (5, 5, 5), (cx - 7, cy + 4, 14, 7))
+    elif kind == 'refinery':
+        pygame.draw.rect(surf, cb, (cx - 13, cy - 5, 20, 14), 0, 2)
+        pygame.draw.circle(surf, P['tib'],    (cx + 11, cy), 8)
+        pygame.draw.circle(surf, P['tib_hi'], (cx + 11, cy), 5)
+    elif kind == 'turret':
+        pygame.draw.rect(surf, cb, (cx - 9, cy - 7, 18, 16), 0, 3)
+        pygame.draw.circle(surf, _lighter(cb, 20), (cx, cy - 1), 6)
+        pygame.draw.line(surf, (200, 200, 200), (cx, cy - 1), (cx + 15, cy - 5), 3)
+    elif kind == 'wall':
+        pygame.draw.rect(surf, (80, 80, 75), (cx - 12, cy - 10, 24, 20), 0, 2)
+        pygame.draw.rect(surf, (110, 108, 100), (cx - 12, cy - 10, 24, 20), 2, 2)
+    elif kind == 'power_plant':
+        pygame.draw.rect(surf, cb, (cx - 13, cy - 5, 20, 14), 0, 2)
+        pygame.draw.circle(surf, (60, 60, 70), (cx - 3, cy), 7)
+        bx2, by2 = cx + 8, cy - 8
+        pts = [(bx2, by2), (bx2 - 3, by2 + 6), (bx2 + 1, by2 + 6), (bx2 - 2, by2 + 13)]
+        pygame.draw.lines(surf, (255, 220, 0), False, pts, 2)
+    elif kind == 'rocket_tank':
+        pygame.draw.rect(surf, cu, (cx - 16, cy - 5, 32, 12), 0, 2)
+        pygame.draw.circle(surf, _lighter(cu, 30), (cx - 2, cy - 1), 7)
+        # twin rocket tubes
+        for dy in (-3, 3):
+            pygame.draw.line(surf, (180, 180, 180), (cx + 2, cy + dy - 1), (cx + 18, cy + dy - 1), 2)
+            pygame.draw.circle(surf, P['rocket'], (cx + 18, cy + dy - 1), 2)
+    elif kind == 'tesla_tank':
+        pygame.draw.rect(surf, cu, (cx - 16, cy - 5, 32, 12), 0, 2)
+        pygame.draw.circle(surf, _lighter(cu, 30), (cx - 2, cy - 1), 7)
+        # tesla coil
+        pygame.draw.circle(surf, P['tesla'], (cx + 4, cy - 8), 5)
+        pygame.draw.circle(surf, P['tesla_hi'], (cx + 4, cy - 8), 3)
+        pygame.draw.line(surf, P['tesla_hi'], (cx + 4, cy - 3), (cx + 4, cy - 8), 2)
+    elif kind == 'laser_tank':
+        pygame.draw.rect(surf, cu, (cx - 16, cy - 5, 32, 12), 0, 2)
+        pygame.draw.circle(surf, _lighter(cu, 30), (cx - 2, cy - 1), 7)
+        # laser barrel with red tip
+        pygame.draw.line(surf, (200, 200, 200), (cx, cy - 1), (cx + 18, cy - 3), 3)
+        pygame.draw.circle(surf, P['laser_r'], (cx + 18, cy - 3), 3)
+    elif kind == 'flame_tank':
+        pygame.draw.rect(surf, cu, (cx - 16, cy - 5, 34, 14), 0, 2)
+        pygame.draw.circle(surf, _lighter(cu, 30), (cx - 2, cy), 7)
+        # flame nozzle + fire
+        pygame.draw.line(surf, (160, 160, 160), (cx + 2, cy), (cx + 14, cy), 3)
+        pygame.draw.circle(surf, P['flame'], (cx + 17, cy), 4)
+        pygame.draw.circle(surf, P['flame_hi'], (cx + 17, cy), 2)
+    elif kind == 'mcv':
+        pygame.draw.rect(surf, cu, (cx - 18, cy - 7, 36, 16), 0, 2)
+        pygame.draw.circle(surf, _lighter(cu, 30), (cx - 2, cy - 1), 8)
+        pygame.draw.line(surf, (200, 200, 200), (cx, cy - 1), (cx + 14, cy - 6), 3)
+        pygame.draw.circle(surf, (255, 220, 60), (cx + 14, cy - 6), 3)
+
+
+def _draw_queue_strip(surf, world, small_font, tab: int, avail: list,
+                      panel_y: int) -> None:
+    qy = panel_y + 4 + HUD_TAB_H + HUD_BTN_H + 8
+    qx = HUD_TAB_X
+    qw = len(HUD_TABS) * HUD_TAB_W - 2
+
+    if tab == 0:
+        bldgs = [(bd, uc) for eid, bd, uc, t
+                 in world.q(BuildingData, UnderConstruction, Team)
+                 if t.id == PLAYER]
+        if not bldgs:
+            idle = small_font.render("No buildings under construction", True, (45, 65, 45))
+            surf.blit(idle, (qx + 4, qy + 1))
+            return
+        slot = (qw - 4) // max(1, len(bldgs))
+        for k, (bd, uc) in enumerate(bldgs[:4]):
+            ix  = qx + 2 + k * slot
+            iw  = slot - 4
+            bpw = max(0, int(iw * uc.ratio))
+            pygame.draw.rect(surf, (0, 0, 0),    (ix, qy, iw, 14))
+            pygame.draw.rect(surf, P['ui_hi'],   (ix, qy, bpw, 14))
+            pygame.draw.rect(surf, (30, 60, 30), (ix, qy, iw, 14), 1)
+            lbl = small_font.render(f"{bd.kind[:7]}  {int(uc.ratio * 100)}%",
+                                    True, P['white'])
+            surf.blit(lbl, (ix + 3, qy + 1))
+        return
+
+    req = HUD_TABS[tab][1]
+    if not avail[tab]:
+        return
+
+    # Gather per-building queues for this tab's building type
+    bld_queues: list = []
+    for eid, bd, t in world.q(BuildingData, Team):
+        if t.id == PLAYER and bd.kind == req and not world.get(eid, UnderConstruction):
+            if bd.prod_queue:
+                bld_queues.append(bd.prod_queue)
+
+    if not bld_queues:
+        idle = small_font.render("Queue empty  ·  click buttons above to train",
+                                 True, (50, 80, 50))
+        surf.blit(idle, (qx + 4, qy + 1))
+        return
+
+    # Show progress bar for each building producing simultaneously
+    slot_w = min(180, (qw - 4) // max(1, len(bld_queues)))
+    for i, pq in enumerate(bld_queues[:4]):
+        ix = qx + i * (slot_w + 4)
+        qkind, qt = pq[0]
+        ratio = 1.0 - qt / PROD_TIME[qkind]
+        pygame.draw.rect(surf, (0, 0, 0),    (ix, qy, slot_w, 14))
+        pygame.draw.rect(surf, P['ui_hi'],   (ix, qy, int(slot_w * ratio), 14))
+        pygame.draw.rect(surf, (30, 60, 30), (ix, qy, slot_w, 14), 1)
+        extra = len(pq) - 1
+        txt = f"{qkind[:6].upper()}" + (f" +{extra}" if extra else "")
+        lbl = small_font.render(txt, True, P['white'])
+        surf.blit(lbl, (ix + 3, qy + 1))
+
+
+# ── HUD ───────────────────────────────────────────────────────────────────────
+def _draw_hud(surf: pygame.Surface, world: World, font, small_font, time: float):
+    meta    = world.meta
+    credits = meta['credits']
+    tab     = meta.get('hud_tab', 0)
+    panel_y = H - HUD_H
+
+    # Panel background + top border
+    pygame.draw.rect(surf, P['ui_bg'], (0, panel_y, W, HUD_H))
+    pygame.draw.line(surf, P['ui_brd'], (0, panel_y), (W, panel_y), 2)
+
+    # ── Left info column ──────────────────────────────────────────────────────
+    surf.blit(font.render(f"${int(credits[PLAYER]):,}", True, P['gold']),
+              (8, panel_y + 8))
+    pu = sum(1 for _, ud, t in world.q(UnitData, Team) if t.id == PLAYER)
+    eu = sum(1 for _, ud, t in world.q(UnitData, Team) if t.id == ENEMY)
+    surf.blit(small_font.render(f"\u25b2 {pu} units", True, P['player']), (8, panel_y + 32))
+    surf.blit(small_font.render(f"\u25bc {eu} enemy", True, P['enemy']),  (8, panel_y + 52))
+
+    # ── Power bar ─────────────────────────────────────────────────────────────
+    pwr_supply = meta.get('power_supply_0', 0)
+    pwr_demand = meta.get('power_demand_0', 0)
+    pwr_ratio  = meta.get('power_ratio_0', 1.0)
+    pwr_col    = P['hp_hi'] if pwr_ratio >= 1.0 else (P['hp_mid'] if pwr_ratio >= 0.5 else P['hp_lo'])
+    bar_x, bar_y, bar_w, bar_h = 8, panel_y + 66, 130, 8
+    pygame.draw.rect(surf, (20, 30, 20), (bar_x, bar_y, bar_w, bar_h))
+    pygame.draw.rect(surf, pwr_col, (bar_x, bar_y, int(bar_w * pwr_ratio), bar_h))
+    pygame.draw.rect(surf, P['ui_brd'], (bar_x, bar_y, bar_w, bar_h), 1)
+    lbl = small_font.render(f"\u26a1 {pwr_supply}/{pwr_demand}", True, pwr_col)
+    surf.blit(lbl, (bar_x + bar_w + 4, bar_y - 1))
+
+    # ── Selection info (right of left-info column) ───────────────────────────
+    sel_set = meta.get('selected', set())
+    sel_x = 148   # right side of left info column
+    if len(sel_set) == 1:
+        seid = next(iter(sel_set))
+        sud = world.get(seid, UnitData)
+        shp = world.get(seid, Health)
+        sbd = world.get(seid, BuildingData)
+        if sud and shp:
+            # Draw mini icon of the unit
+            fn = _DRAWERS.get(sud.kind)
+            if fn:
+                icon_x, icon_y = sel_x + 10, panel_y + 18
+                if sud.kind in ('tank', 'rocket_tank', 'tesla_tank',
+                                'laser_tank', 'flame_tank'):
+                    fn(surf, icon_x, icon_y, PLAYER, 0.0, 0.0, False, time)
+                else:
+                    fn(surf, icon_x, icon_y, PLAYER, 0.0, False, time)
+            surf.blit(small_font.render(f"{sud.kind.upper()}", True, P['white']),
+                      (sel_x + 28, panel_y + 8))
+            surf.blit(small_font.render(f"HP {int(shp.hp)}/{int(shp.max_hp)}"
+                                        f"  DMG {int(sud.damage)}  RNG {int(sud.rng)}",
+                                        True, P['gray']),
+                      (sel_x + 28, panel_y + 22))
+            harv = world.get(seid, Harvester)
+            if harv:
+                surf.blit(small_font.render(f"Carry: {int(harv.carry)}/{int(HARVEST_CARRY)}  [{harv.state}]",
+                                            True, P['tib_hi']),
+                          (sel_x, panel_y + 38))
+            if sud.kind == 'mcv':
+                surf.blit(small_font.render("Press [D] to DEPLOY base",
+                                            True, P['build_ok']),
+                          (sel_x, panel_y + 38))
+        elif sbd and shp:
+            surf.blit(small_font.render(f"{sbd.name}", True, P['white']),
+                      (sel_x, panel_y + 8))
+            surf.blit(small_font.render(f"HP {int(shp.hp)}/{int(shp.max_hp)}",
+                                        True, P['gray']),
+                      (sel_x, panel_y + 22))
+    elif len(sel_set) > 1:
+        # Group selected units by kind and show icon + count for each type
+        kind_counts: dict[str, int] = {}
+        for seid in sel_set:
+            sud = world.get(seid, UnitData)
+            if sud:
+                kind_counts[sud.kind] = kind_counts.get(sud.kind, 0) + 1
+        ix = sel_x
+        iy = panel_y + 10
+        for kind, count in kind_counts.items():
+            fn = _DRAWERS.get(kind)
+            if fn:
+                icon_x = ix + 10
+                icon_y = iy + 4
+                if kind in ('tank', 'rocket_tank', 'tesla_tank',
+                            'laser_tank', 'flame_tank'):
+                    fn(surf, icon_x, icon_y, PLAYER, 0.0, 0.0, False, time)
+                else:
+                    fn(surf, icon_x, icon_y, PLAYER, 0.0, False, time)
+            # Count badge
+            cnt_txt = small_font.render(str(count), True, P['white'])
+            surf.blit(cnt_txt, (ix + 22, iy + 14))
+            ix += 38
+            if ix > HUD_TAB_X - 46:
+                break
+        # Total count
+        surf.blit(small_font.render(f"{len(sel_set)} selected", True, P['white']),
+                  (sel_x, panel_y + 38))
+
+    pygame.draw.line(surf, P['ui_brd'],
+                     (HUD_TAB_X - 8, panel_y + 6),
+                     (HUD_TAB_X - 8, panel_y + HUD_H - 6), 1)
+
+    # ── Tab availability ──────────────────────────────────────────────────────
+    avail = [_has_complete_bldg(world, 'base'),
+             _has_complete_bldg(world, 'barracks'),
+             _has_complete_bldg(world, 'factory')]
+
+    # ── Tab headers ───────────────────────────────────────────────────────────
+    for i, (label, _req) in enumerate(HUD_TABS):
+        tx, ty = HUD_TAB_X + i * HUD_TAB_W, panel_y + 4
+        tw, th = HUD_TAB_W - 2, HUD_TAB_H
+        active, locked = (i == tab), not avail[i]
+
+        if active:
+            pygame.draw.rect(surf, P['ui_brd'], (tx, ty, tw, th), 0, 3)
+            pygame.draw.line(surf, P['ui_hi'],
+                             (tx + 1, ty + th - 1), (tx + tw - 2, ty + th - 1))
+            tcol = P['ui_bg']
+        elif locked:
+            pygame.draw.rect(surf, (12, 20, 12), (tx, ty, tw, th), 0, 3)
+            pygame.draw.rect(surf, (40, 55, 40), (tx, ty, tw, th), 1, 3)
+            tcol = (50, 70, 50)
+        else:
+            pygame.draw.rect(surf, (10, 20, 10), (tx, ty, tw, th), 0, 3)
+            pygame.draw.rect(surf, P['ui_hi'],   (tx, ty, tw, th), 1, 3)
+            tcol = P['ui_hi']
+
+        lbl = small_font.render(label, True, tcol)
+        surf.blit(lbl, (tx + (tw - lbl.get_width()) // 2,
+                        ty + (th - lbl.get_height()) // 2))
+        if locked:
+            _draw_lock_icon(surf, tx + tw - 14, ty + 5)
+
+    # ── Content area ──────────────────────────────────────────────────────────
+    cx0 = HUD_TAB_X
+    cy0 = panel_y + 4 + HUD_TAB_H     # 634
+    cw  = len(HUD_TABS) * HUD_TAB_W - 2
+    ch  = HUD_BTN_H + 6
+    pygame.draw.rect(surf, (8, 16, 8),   (cx0, cy0, cw, ch))
+    pygame.draw.rect(surf, (25, 55, 25), (cx0, cy0, cw, ch), 1)
+
+    items  = HUD_TAB_ITEMS[tab]
+    locked = not avail[tab]
+
+    if locked:
+        req_name = {'base':      'COMMAND CENTER',
+                    'barracks': 'BARRACKS',
+                    'factory':  'WAR FACTORY'}[HUD_TABS[tab][1]]
+        msg = font.render(f"BUILD A {req_name} FIRST", True, (55, 85, 55))
+        surf.blit(msg, (cx0 + cw // 2 - msg.get_width() // 2,
+                        cy0 + ch // 2 - msg.get_height() // 2))
+    else:
+        bx0 = cx0 + 4
+        by  = cy0 + 3
+        for j, kind in enumerate(items):
+            bx   = bx0 + j * (HUD_BTN_W + HUD_BTN_GAP)
+            cost = BUILD_COST[kind] if tab == 0 else UDAT[kind][6]
+            can  = credits[PLAYER] >= cost
+            bcol = P['ui_hi'] if can else (45, 70, 45)
+            bg   = (14, 28, 14) if can else (8, 14, 8)
+
+            pygame.draw.rect(surf, bg,   (bx, by, HUD_BTN_W, HUD_BTN_H), 0, 4)
+            pygame.draw.rect(surf, bcol, (bx, by, HUD_BTN_W, HUD_BTN_H), 2, 4)
+
+            # Hotkey tag
+            hk = small_font.render(f"[{j + 1}]",
+                                   True, _darker(bcol, 20) if can else (40, 60, 40))
+            surf.blit(hk, (bx + 3, by + 3))
+
+            # Programmatic icon (centred in upper portion of button)
+            _draw_btn_icon(surf, bx + HUD_BTN_W // 2, by + 22, kind)
+
+            # Name
+            nl = small_font.render(kind, True, bcol)
+            surf.blit(nl, (bx + HUD_BTN_W // 2 - nl.get_width() // 2,
+                           by + HUD_BTN_H - 24))
+            # Cost
+            cl = small_font.render(f"${cost}",
+                                   True, P['gold'] if can else (70, 55, 15))
+            surf.blit(cl, (bx + HUD_BTN_W // 2 - cl.get_width() // 2,
+                           by + HUD_BTN_H - 12))
+
+    # ── Bottom strip: placing hint  OR  queue/progress ────────────────────────
+    if meta.get('mode') == 'place_building':
+        hint = small_font.render(
+            f"Click map to place  {meta.get('place_type', '')}  \u00b7  RMB cancel",
+            True, P['build_ok'])
+        surf.blit(hint, (cx0 + 4,
+                         panel_y + 4 + HUD_TAB_H + HUD_BTN_H + 10))
+    else:
+        _draw_queue_strip(surf, world, small_font, tab, avail, panel_y)
+
+    # ── Right: unit counts ────────────────────────────────────────────────────
+    stats_x = W - 140
+    surf.blit(font.render(f"Units: {pu}", True, P['player']), (stats_x, panel_y + 8))
+    surf.blit(font.render(f"Enemy: {eu}", True, P['enemy']),  (stats_x, panel_y + 32))
+
+
+_mini_fog_surf = None
+_mini_fog_frame = 0
+
+def _draw_minimap(surf, world, top_y):
+    global _mini_fog_surf, _mini_fog_frame
+    mx = 6
+    pygame.draw.rect(surf, (0, 0, 0),   (mx - 2, top_y - 2, MINI + 4, MINI + 4))
+    pygame.draw.rect(surf, P['ui_brd'], (mx - 2, top_y - 2, MINI + 4, MINI + 4), 2)
+
+    # Pre-rendered terrain minimap
+    mini_surf = world.meta.get('mini_surf')
+    if mini_surf:
+        surf.blit(mini_surf, (mx, top_y))
+    else:
+        pygame.draw.rect(surf, (20, 35, 15), (mx, top_y, MINI, MINI))
+
+    # Fog overlay on minimap (rebuild every 6 frames)
+    fog = world.meta['fog']
+    scale_x = MINI / MAP_W
+    scale_y = MINI / MAP_H
+    _mini_fog_frame += 1
+    if _mini_fog_surf is None or _mini_fog_frame % 6 == 0:
+        step = 4
+        if _mini_fog_surf is None:
+            _mini_fog_surf = pygame.Surface((MINI, MINI), pygame.SRCALPHA)
+        _mini_fog_surf.fill((0, 0, 0, 0))
+        for fy in range(0, MAP_H, step):
+            for fx in range(0, MAP_W, step):
+                f = fog[fy, fx]
+                if f == 0:
+                    bx = int(fx * scale_x)
+                    by = int(fy * scale_y)
+                    bw = max(1, int(step * scale_x) + 1)
+                    bh = max(1, int(step * scale_y) + 1)
+                    pygame.draw.rect(_mini_fog_surf, (0, 0, 0, 210), (bx, by, bw, bh))
+                elif f == 1:
+                    bx = int(fx * scale_x)
+                    by = int(fy * scale_y)
+                    bw = max(1, int(step * scale_x) + 1)
+                    bh = max(1, int(step * scale_y) + 1)
+                    pygame.draw.rect(_mini_fog_surf, (0, 0, 0, 120), (bx, by, bw, bh))
+    surf.blit(_mini_fog_surf, (mx, top_y))
+
+    # Entities
+    for eid, pos, team in world.q(Position, Team):
+        ex = int(pos.x / (MAP_W * TILE) * MINI)
+        ey = int(pos.y / (MAP_H * TILE) * MINI)
+        c  = P['player'] if team.id == PLAYER else P['enemy']
+        # Only show enemy units in visible fog
+        if team.id == ENEMY:
+            ftx = int(pos.x // TILE)
+            fty = int(pos.y // TILE)
+            if 0 <= ftx < MAP_W and 0 <= fty < MAP_H and fog[fty, ftx] < 2:
+                continue
+        ud = world.get(eid, UnitData)
+        bd = world.get(eid, BuildingData)
+        r  = 1 if ud else 3
+        pygame.draw.circle(surf, c, (mx + ex, top_y + ey), r)
+
+    # Resources (only in explored/visible areas)
+    for eid, pos, res in world.q(Position, Resource):
+        if res.amount <= 0:
+            continue
+        ftx = int(pos.x // TILE)
+        fty = int(pos.y // TILE)
+        if 0 <= ftx < MAP_W and 0 <= fty < MAP_H and fog[fty, ftx] == 0:
+            continue
+        ex = int(pos.x / (MAP_W * TILE) * MINI)
+        ey = int(pos.y / (MAP_H * TILE) * MINI)
+        pygame.draw.circle(surf, P['tib'], (mx + ex, top_y + ey), 2)
+
+    # Camera viewport box
+    cam = world.meta['cam']
+    vx  = int(cam[0] / (MAP_W * TILE) * MINI)
+    vy  = int(cam[1] / (MAP_H * TILE) * MINI)
+    vw  = int(W       / (MAP_W * TILE) * MINI)
+    vh  = int((H-HUD_H) / (MAP_H * TILE) * MINI)
+    pygame.draw.rect(surf, P['white'], (mx + vx, top_y + vy, vw, vh), 1)
+
+
+# ── Game-over overlay ─────────────────────────────────────────────────────────
+def _draw_game_over(surf, result: str, big_font, font):
+    overlay = _get_surf(W, H)
+    overlay.fill((0, 0, 0, 160))
+    surf.blit(overlay, (0, 0))
+    if result == 'win':
+        msg, col = "MISSION ACCOMPLISHED", P['ui_hi']
+    else:
+        msg, col = "BASE DESTROYED", P['enemy']
+    t = big_font.render(msg, True, col)
+    sub = font.render("Press R to restart or ESC to quit", True, P['white'])
+    surf.blit(t,   (W // 2 - t.get_width() // 2,   H // 2 - 50))
+    surf.blit(sub, (W // 2 - sub.get_width() // 2, H // 2 + 20))
+
+
+# ── Ghost building preview ────────────────────────────────────────────────────
+def _draw_ghost(surf, cam, kind, world):
+    mx, my = pygame.mouse.get_pos()
+    if my >= H - HUD_H:
+        return
+    _, bw, bh = BDAT[kind]
+    raw_wx = mx + cam[0]
+    raw_wy = my + cam[1]
+    if kind == 'wall':
+        raw_wx = round(raw_wx / TILE) * TILE
+        raw_wy = round(raw_wy / TILE) * TILE
+    ok    = _in_influence(world, raw_wx, raw_wy, PLAYER)
+    color = P['build_ok'] if ok else P['build_no']
+    sx    = int(raw_wx - cam[0] - bw // 2)
+    sy    = int(raw_wy - cam[1] - bh // 2)
+    ghost = _get_surf(bw, bh)
+    ghost.fill((*color, 80))
+    surf.blit(ghost, (sx, sy))
+    pygame.draw.rect(surf, color, (sx, sy, bw, bh), 2)
+
+
+def _draw_wall_drag_line(surf, cam, world, drag_start):
+    """Preview all wall ghosts along the drag line."""
+    mx, my = pygame.mouse.get_pos()
+    if my >= H - HUD_H:
+        return
+    wx1 = mx + cam[0]
+    wy1 = my + cam[1]
+    positions = _wall_line_centers(drag_start[0], drag_start[1], wx1, wy1)
+    bw = bh = TILE
+    ghost = _get_surf(bw, bh)
+    for cx, cy in positions:
+        ok    = _in_influence(world, cx, cy, PLAYER)
+        color = P['build_ok'] if ok else P['build_no']
+        sx    = int(cx - cam[0] - bw // 2)
+        sy    = int(cy - cam[1] - bh // 2)
+        ghost.fill((*color, 80))
+        surf.blit(ghost, (sx, sy))
+        pygame.draw.rect(surf, color, (sx, sy, bw, bh), 2)
+
+
+_influence_surf = None
+
+def _draw_influence_overlay(surf, world, cam):
+    """Additive blue tint showing player influence on the map."""
+    global _influence_surf
+    if _influence_surf is None:
+        _influence_surf = pygame.Surface((W, H - HUD_H))
+    _influence_surf.fill((0, 0, 0))
+    for _eid, pos, team, bd in world.q(Position, Team, BuildingData):
+        if team.id != PLAYER:
+            continue
+        cx = int(pos.x + bd.w // 2 - cam[0])
+        cy = int(pos.y + bd.h // 2 - cam[1])
+        r  = INFLUENCE_RADIUS.get(bd.kind, 200)
+        if cx + r < 0 or cx - r > W or cy + r < 0 or cy - r > H - HUD_H:
+            continue
+        pygame.draw.circle(_influence_surf, (0, 22, 44), (cx, cy), r)     # soft fill
+        pygame.draw.circle(_influence_surf, (0, 42, 80), (cx, cy), r, 2)  # edge ring
+    surf.blit(_influence_surf, (0, 0), special_flags=pygame.BLEND_ADD)
+
+
+# ── Water shimmer ─────────────────────────────────────────────────────────────
+_water_overlay = None
+
+def _draw_water_shimmer(surf, tiles, cam, t):
+    """Cheaply animate water tiles with a subtle rolling highlight."""
+    global _water_overlay
+    if _water_overlay is None:
+        _water_overlay = pygame.Surface((W, H - HUD_H), pygame.SRCALPHA)
+    _water_overlay.fill((0, 0, 0, 0))
+    tile_ox = int(cam[0]) % TILE
+    tile_oy = int(cam[1]) % TILE
+    tx0     = int(cam[0]) // TILE
+    ty0     = int(cam[1]) // TILE
+    cols    = W  // TILE + 2
+    rows    = (H - HUD_H) // TILE + 2
+    phase   = t * 1.2  # slow roll
+    drew = False
+    for drow in range(rows):
+        my = ty0 + drow
+        if not (0 <= my < MAP_H):
+            continue
+        for dcol in range(cols):
+            mx = tx0 + dcol
+            if not (0 <= mx < MAP_W):
+                continue
+            if tiles[my][mx] != TWATER:
+                continue
+            sx = dcol * TILE - tile_ox
+            sy = drow * TILE - tile_oy
+            # Primary shimmer wave
+            wave1 = math.sin(phase + mx * 0.35 + my * 0.25)
+            # Secondary crossing wave for more natural look
+            wave2 = math.sin(phase * 0.7 + mx * 0.2 - my * 0.4)
+            alpha = int(14 + 10 * wave1 + 6 * wave2)
+            if alpha > 2:
+                pygame.draw.rect(_water_overlay, (50, 120, 210, alpha),
+                                 (sx, sy, TILE, TILE))
+                drew = True
+            # Specular highlight streak (slow moving)
+            spec = math.sin(phase * 0.5 + mx * 0.6 + my * 0.15)
+            if spec > 0.75:
+                sa = int(20 * (spec - 0.75) / 0.25)
+                hw = TILE // 2 + 2
+                pygame.draw.line(_water_overlay, (140, 190, 255, sa),
+                                 (sx + 2, sy + TILE // 2),
+                                 (sx + hw, sy + TILE // 2), 1)
+                drew = True
+    if drew:
+        surf.blit(_water_overlay, (0, 0), special_flags=pygame.BLEND_ADD)
+
+
+# ── Day/night atmosphere ──────────────────────────────────────────────────────
+_DAY_NIGHT_SURF = None
+
+def _draw_day_night_tint(surf, t):
+    """Slow subtle colour temperature cycle (120s period). Very cheap."""
+    global _DAY_NIGHT_SURF
+    if _DAY_NIGHT_SURF is None:
+        _DAY_NIGHT_SURF = pygame.Surface((W, H - HUD_H), pygame.SRCALPHA)
+    cycle = (math.sin(t * 0.05236) + 1) * 0.5  # 0 → 1 over ~120s
+    # warm golden dusk tint near 0, cool blue night near 1
+    r = int(12 * (1 - cycle))
+    g = int(4  * (1 - cycle))
+    b = int(14 * cycle)
+    a = int(18 * (0.3 + 0.7 * abs(cycle - 0.5) * 2))  # stronger at extremes
+    if a < 3:
+        return
+    _DAY_NIGHT_SURF.fill((r, g, b, a))
+    surf.blit(_DAY_NIGHT_SURF, (0, 0))
+
+
+# ── Movement dust ─────────────────────────────────────────────────────────────
+_move_dust_accum: dict = {}  # eid → accumulated time
+
+def _spawn_move_dust(fx: list, pos, ud) -> None:
+    """Every ~0.08s while moving, emit a small ground-coloured puff."""
+    eid_hash = id(pos)  # unique per entity position component
+    acc = _move_dust_accum.get(eid_hash, 0) + 0.017  # ~approx dt at 60fps
+    if acc >= 0.08:
+        acc = 0.0
+        # Heavy units make bigger dust
+        sz = 2.5 if ud.kind in ('tank', 'harvester', 'mcv') else 1.5
+        fx.append({
+            'kind': 'move_dust',
+            'x': pos.x + random.uniform(-4, 4),
+            'y': pos.y + random.uniform(2, 8),
+            'vx': random.uniform(-8, 8),
+            'vy': random.uniform(-12, -2),
+            't': random.uniform(0.3, 0.7),
+            'mt': 0.7,
+            'sz': sz,
+        })
+    _move_dust_accum[eid_hash] = acc
+
+
+# ── Building ambient FX ──────────────────────────────────────────────────────
+_bldg_fx_accum: dict = {}
+
+def _building_ambient(fx: list, pos, bd, t) -> None:
+    """Factories smoke, refineries glow, bases blink – all on cheap timers."""
+    key = id(bd)
+    acc = _bldg_fx_accum.get(key, 0) + 0.017
+    fire = False
+    if bd.kind == 'factory' and acc >= 0.6:
+        acc = 0.0
+        fire = True
+        fx.append({
+            'kind': 'smoke', 'x': pos.x + 10, 'y': pos.y + 4,
+            'vx': random.uniform(-4, 4), 'vy': random.uniform(-18, -8),
+            't': random.uniform(1.0, 2.0), 'mt': 2.0,
+            'color': P['smoke'], 'sz': random.uniform(3, 6),
+        })
+    elif bd.kind == 'refinery' and acc >= 0.9:
+        acc = 0.0
+        fire = True
+        fx.append({
+            'kind': 'particle',
+            'x': pos.x + bd.w - 18, 'y': pos.y + bd.h // 2,
+            'vx': 0, 'vy': -10,
+            't': 0.4, 'mt': 0.4,
+            'color': P['tib_hi'], 'sz': 3.0,
+        })
+    elif bd.kind == 'base' and acc >= 1.5:
+        acc = 0.0
+        fire = True
+        # Radar ping
+        fx.append({
+            'kind': 'shockwave',
+            'x': pos.x + bd.w // 2, 'y': pos.y + bd.h // 2,
+            'max_r': 30, 't': 0.8, 'mt': 0.8,
+            'color': P['select'] if t % 6 < 3 else P['player'],
+        })
+    if not fire:
+        _bldg_fx_accum[key] = acc
+    else:
+        _bldg_fx_accum[key] = 0.0
+
+
+# ── Main render system ────────────────────────────────────────────────────────
+class RenderSys(System):
+    def __init__(self, screen, terrain_surf, font, small_font, big_font, clock=None):
+        self.screen       = screen
+        self.terrain_surf = terrain_surf
+        self.font         = font
+        self.small_font   = small_font
+        self.big_font     = big_font
+        self._clock       = clock
+        self._time        = 0.0
+        # Ambient dust pool (spawn once, recycle)
+        self._dust: list[dict] = []
+        self._dust_timer = 0.0
+
+    def update(self, world: World, dt: float) -> None:
+        self._time += dt
+        t   = self._time
+        scr = self.screen
+        cam = list(world.meta['cam'])  # copy so we can shake it
+        fog = world.meta['fog']
+        tiles = world.meta['tiles']
+
+
+        # ── 1. Terrain ───────────────────────────────────────────────────────
+        src = pygame.Rect(int(cam[0]), int(cam[1]),
+                          W, H - HUD_H)
+        scr.blit(self.terrain_surf, (0, 0), src)
+
+        # ── 1b. Water shimmer overlay ─────────────────────────────────────
+        _ensure_surfaces()
+        _draw_water_shimmer(scr, tiles, cam, t)
+
+        # ── 1c. Ambient dust particles ────────────────────────────────────
+        self._dust_timer += dt
+        if self._dust_timer >= 0.12 and len(self._dust) < 40:
+            self._dust_timer = 0.0
+            # Spawn in visible area
+            wx = cam[0] + random.uniform(0, W)
+            wy = cam[1] + random.uniform(0, H - HUD_H)
+            self._dust.append({
+                'x': wx, 'y': wy,
+                'vx': random.uniform(8, 25), 'vy': random.uniform(-6, 6),
+                't': random.uniform(2.0, 5.0),
+                'mt': 5.0,
+                'sz': random.uniform(1.0, 2.5),
+            })
+        live_dust = []
+        for d in self._dust:
+            d['t'] -= dt
+            if d['t'] > 0:
+                d['x'] += d['vx'] * dt
+                d['y'] += d['vy'] * dt
+                dsx = int(d['x'] - cam[0])
+                dsy = int(d['y'] - cam[1])
+                if 0 <= dsx < W and 0 <= dsy < H - HUD_H:
+                    alpha = min(50, int(50 * d['t'] / d['mt']))
+                    if alpha > 5:
+                        sz = max(1, int(d['sz']))
+                        ds = _get_surf(sz * 2, sz * 2)
+                        pygame.draw.circle(ds, (180, 175, 160, alpha), (sz, sz), sz)
+                        scr.blit(ds, (dsx - sz, dsy - sz))
+                live_dust.append(d)
+        self._dust = live_dust
+
+        # ── 1d. Influence overlay ───────────────────────────────────
+        if not world.meta.get('game_over'):
+            _draw_influence_overlay(scr, world, cam)
+
+        # ── 2. Tiberium fields ───────────────────────────────────────────────
+        for _eid, pos, res in world.q(Position, Resource):
+            if res.amount <= 0:
+                continue
+            sx = int(pos.x - cam[0])
+            sy = int(pos.y - cam[1])
+            if -30 < sx < W + 30 and -30 < sy < H - HUD_H + 30:
+                _draw_tiberium(scr, sx, sy, res.amount / res.max_amount, t)
+
+        # ── 3. Buildings (below units for z-order) ───────────────────────────
+        for eid, pos, bd, hp, team in world.q(Position, BuildingData, Health, Team):
+            sx = int(pos.x - cam[0])
+            sy = int(pos.y - cam[1])
+            if not (-bd.w < sx < W + bd.w and -bd.h < sy < H - HUD_H + bd.h):
+                continue
+            tx = int(pos.x // TILE)
+            ty2 = int(pos.y // TILE)
+            if 0 <= tx < MAP_W and 0 <= ty2 < MAP_H and fog[ty2, tx] == 0:
+                continue
+            uc  = world.get(eid, UnderConstruction)
+            sel = world.get(eid, Selectable)
+            _draw_building(scr, sx, sy, bd, team.id, hp.ratio, t,
+                           sel and sel.selected,
+                           uc.ratio if uc else None)
+            # ── Active building ambient FX ────────────────────
+            if uc is None:
+                _building_ambient(world.meta['fx'], pos, bd, t)
+
+        # ── 4. Units ─────────────────────────────────────────────────────────
+        for eid, pos, ud, hp, team in world.q(Position, UnitData, Health, Team):
+            sx = int(pos.x - cam[0])
+            sy = int(pos.y - cam[1])
+            if not (-30 < sx < W + 30 and -30 < sy < H - HUD_H + 30):
+                continue
+            tx3 = int(pos.x // TILE)
+            ty3 = int(pos.y // TILE)
+            if 0 <= tx3 < MAP_W and 0 <= ty3 < MAP_H and fog[ty3, tx3] == 0:
+                continue
+            sel = world.get(eid, Selectable)
+            mv = world.get(eid, Movement)
+            fn  = _DRAWERS.get(ud.kind)
+            if fn:
+                if ud.kind in ('tank', 'rocket_tank', 'tesla_tank',
+                               'laser_tank', 'flame_tank'):
+                    fn(scr, sx, sy, team.id, ud.facing, ud.turret,
+                       sel and sel.selected, t)
+                else:
+                    fn(scr, sx, sy, team.id, ud.facing,
+                       sel and sel.selected, t)
+            _hp_bar(scr, sx, sy - ud.radius - 8, 28, hp.ratio)
+            # ── movement dust trail ───────────────────────────
+            if mv and mv.tx is not None:
+                _spawn_move_dust(world.meta['fx'], pos, ud)
+
+        # ── 5. Projectiles ───────────────────────────────────────────────────
+        for _eid, pos, proj in world.q(Position, Projectile):
+            sx = int(pos.x - cam[0])
+            sy = int(pos.y - cam[1])
+            if -10 < sx < W + 10 and -10 < sy < H - HUD_H + 10:
+                _spos.x = sx; _spos.y = sy
+                _draw_projectile(scr, _spos, proj)
+
+        # ── 6. Particles / FX ────────────────────────────────────────────────
+        for item in world.meta['fx']:
+            # Line-based effects use midpoint for culling
+            if 'x' in item:
+                sx = int(item['x'] - cam[0])
+                sy = int(item['y'] - cam[1])
+            else:
+                sx = int((item.get('sx', 0) + item.get('ex', 0)) / 2 - cam[0])
+                sy = int((item.get('sy', 0) + item.get('ey', 0)) / 2 - cam[1])
+            if not (-60 < sx < W + 60 and -60 < sy < H - HUD_H + 60):
+                continue
+
+            if item['kind'] == 'flash':
+                a = int(255 * item['t'] / 0.18)
+                a = min(255, a)
+                pygame.draw.circle(scr, (*P['fire_hi'][:3], min(255, a)),
+                                   (sx, sy), 10)
+                _glow(scr, sx, sy, P['fire_hi'], 20, min(180, a))
+                _glow(scr, sx, sy, P['nova'], 12, min(140, a))
+
+            elif item['kind'] == 'shockwave':
+                ratio = 1.0 - (item['t'] / item['mt'])
+                r = max(1, int(ratio * item['max_r']))
+                alpha = int(200 * (1.0 - ratio))
+                c = item['color']
+                if r > 1 and alpha > 0:
+                    sw = _get_surf(r * 2 + 6, r * 2 + 6)
+                    cx2, cy2 = r + 3, r + 3
+                    pygame.draw.circle(sw, (*c[:3], min(255, alpha)),
+                                       (cx2, cy2), r, max(2, r // 6))
+                    ir = max(1, r - 3)
+                    pygame.draw.circle(sw, (*P['nova'][:3], min(255, alpha // 2)),
+                                       (cx2, cy2), ir, 1)
+                    scr.blit(sw, (sx - r - 3, sy - r - 3),
+                             special_flags=pygame.BLEND_ADD)
+
+            elif item['kind'] == 'nova':
+                ratio = item['t'] / item['mt']
+                r = max(1, int(item['max_r'] * (1.0 - ratio * 0.3)))
+                alpha = int(255 * ratio)
+                if alpha > 0:
+                    _glow(scr, sx, sy, P['nova'], r, min(220, alpha))
+                    _glow(scr, sx, sy, P['fire_hi'], r // 2, min(180, alpha))
+
+            elif item['kind'] == 'arc':
+                ratio = item['t'] / item['mt']
+                alpha = int(240 * ratio)
+                aim = item['aim']
+                length = item['len']
+                segs = item['segs']
+                c = item['color']
+                pts = [(sx, sy)]
+                for i in range(1, segs + 1):
+                    frac = i / segs
+                    bx = sx + math.cos(aim) * length * frac
+                    by = sy + math.sin(aim) * length * frac
+                    bx += random.uniform(-8, 8)
+                    by += random.uniform(-8, 8)
+                    pts.append((int(bx), int(by)))
+                if len(pts) >= 2 and alpha > 10:
+                    for i in range(len(pts) - 1):
+                        pygame.draw.line(scr, c, pts[i], pts[i + 1], 3)
+                    for i in range(len(pts) - 1):
+                        pygame.draw.line(scr, P['elec_hi'],
+                                         pts[i], pts[i + 1], 1)
+
+            elif item['kind'] == 'hit_flash':
+                ratio = item['t'] / item['mt']
+                r = item['r']
+                alpha = int(200 * ratio)
+                if alpha > 0:
+                    hs = _get_surf(r * 2, r * 2)
+                    pygame.draw.circle(hs, (255, 255, 255, min(255, alpha)),
+                                       (r, r), r)
+                    scr.blit(hs, (sx - r, sy - r),
+                             special_flags=pygame.BLEND_ADD)
+
+            elif item['kind'] == 'debris':
+                ratio = item['t'] / item['mt']
+                sz = max(1, int(item['sz'] * ratio))
+                c = item['color']
+                pygame.draw.rect(scr, c, (sx - sz, sy - sz, sz * 2, sz * 2))
+                # tiny ember trail
+                if sz >= 2:
+                    pygame.draw.circle(scr, P['bang'], (sx, sy + sz + 1), 1)
+
+            elif item['kind'] == 'move_dust':
+                ratio = item['t'] / item['mt']
+                alpha = int(40 * ratio)
+                sz = max(1, int(item['sz'] * (1.2 - ratio * 0.4)))
+                if alpha > 2:
+                    ds2 = _get_surf(sz * 2, sz * 2)
+                    pygame.draw.circle(ds2, (140, 130, 100, alpha), (sz, sz), sz)
+                    scr.blit(ds2, (sx - sz, sy - sz),
+                             special_flags=pygame.BLEND_ADD)
+
+            elif item['kind'] == 'dmg_num':
+                ratio = item['t'] / item['mt']
+                alpha = int(255 * min(1.0, ratio * 2.0))
+                if alpha > 10:
+                    val = item['val']
+                    # Big hits get brighter colour
+                    if val >= 60:
+                        c = P['fire_hi']
+                    elif val >= 30:
+                        c = P['bang']
+                    else:
+                        c = (220, 220, 220)
+                    dtxt = self.small_font.render(str(val), True, c)
+                    dtxt.set_alpha(alpha)
+                    scr.blit(dtxt, (sx - dtxt.get_width() // 2,
+                                   sy - dtxt.get_height() // 2))
+
+            elif item['kind'] in ('particle', 'smoke'):
+                ratio = item['t'] / item['mt']
+                alpha = int(220 * ratio)
+                sz    = max(1, int(item['sz'] * ratio))
+                c     = item['color']
+                if item['kind'] == 'smoke':
+                    sc = _get_surf(sz * 2, sz * 2)
+                    pygame.draw.circle(sc, (*c, alpha), (sz, sz), sz)
+                    scr.blit(sc, (sx - sz, sy - sz),
+                             special_flags=pygame.BLEND_ADD)
+                else:
+                    pygame.draw.circle(scr, c, (sx, sy), sz)
+                    if sz >= 2:
+                        _glow(scr, sx, sy, c, sz + 3, min(80, alpha))
+
+            elif item['kind'] == 'click':
+                ratio = 1.0 - (item['t'] / 0.5)
+                r     = int(ratio * 22)
+                a     = int(200 * (1 - ratio))
+                if r > 0:
+                    cs = _get_surf(r * 2 + 4, r * 2 + 4)
+                    pygame.draw.circle(cs, (*P['select'][:3], a), (r + 2, r + 2), r, 2)
+                    scr.blit(cs, (sx - r - 2, sy - r - 2),
+                             special_flags=pygame.BLEND_ADD)
+
+            elif item['kind'] == 'tesla_bolt':
+                ratio = item['t'] / item['mt']
+                alpha = int(255 * ratio)
+                sx1 = int(item['sx'] - cam[0])
+                sy1 = int(item['sy'] - cam[1])
+                ex1 = int(item['ex'] - cam[0])
+                ey1 = int(item['ey'] - cam[1])
+                segs = item['segs']
+                jitter = item['jitter']
+                # Build jagged lightning path
+                pts = [(sx1, sy1)]
+                for i in range(1, segs):
+                    frac = i / segs
+                    mx2 = sx1 + (ex1 - sx1) * frac + random.uniform(-jitter, jitter)
+                    my2 = sy1 + (ey1 - sy1) * frac + random.uniform(-jitter, jitter)
+                    pts.append((int(mx2), int(my2)))
+                pts.append((ex1, ey1))
+                if len(pts) >= 2 and alpha > 10:
+                    # Thick glow layer
+                    for i in range(len(pts) - 1):
+                        pygame.draw.line(scr, P['tesla_bg'], pts[i], pts[i+1], 5)
+                    # Core bolt
+                    for i in range(len(pts) - 1):
+                        pygame.draw.line(scr, P['tesla'], pts[i], pts[i+1], 3)
+                    # Bright inner core
+                    for i in range(len(pts) - 1):
+                        pygame.draw.line(scr, P['tesla_hi'], pts[i], pts[i+1], 1)
+
+            elif item['kind'] == 'laser_beam':
+                ratio = item['t'] / item['mt']
+                alpha = int(255 * ratio)
+                sx1 = int(item['sx'] - cam[0])
+                sy1 = int(item['sy'] - cam[1])
+                ex1 = int(item['ex'] - cam[0])
+                ey1 = int(item['ey'] - cam[1])
+                team_id = item['team']
+                lc = P['laser_r'] if team_id == PLAYER else P['laser_g']
+                if alpha > 10:
+                    # Wide glow via thick line on temp surface
+                    lw = abs(ex1 - sx1) + 20
+                    lh = abs(ey1 - sy1) + 20
+                    lox = min(sx1, ex1) - 10
+                    loy = min(sy1, ey1) - 10
+                    gs = _get_surf(lw, lh)
+                    pygame.draw.line(gs, (*lc[:3], min(255, alpha // 2)),
+                                     (sx1 - lox, sy1 - loy), (ex1 - lox, ey1 - loy), 7)
+                    scr.blit(gs, (lox, loy), special_flags=pygame.BLEND_ADD)
+                    # Core beam
+                    pygame.draw.line(scr, lc, (sx1, sy1), (ex1, ey1), 3)
+                    # White-hot center
+                    pygame.draw.line(scr, (255, 255, 255),
+                                     (sx1, sy1), (ex1, ey1), 1)
+
+        # ── 7. Selection drag box ─────────────────────────────────────────────
+        sel_box = world.meta.get('sel_box')
+        sel_st  = world.meta.get('sel_start')
+        if sel_st is not None:
+            mx, my = pygame.mouse.get_pos()
+            sx2, sy2 = sel_st
+            rx, ry   = min(sx2, mx), min(sy2, my)
+            rw, rh   = abs(mx - sx2), abs(my - sy2)
+            if rw > 4 or rh > 4:
+                box_surf = pygame.Surface((rw, rh), pygame.SRCALPHA)
+                box_surf.fill((*P['select'], 25))
+                pygame.draw.rect(box_surf, (*P['select'], 180), (0, 0, rw, rh), 1)
+                scr.blit(box_surf, (rx, ry))
+
+        # ── 8. Fog of war ────────────────────────────────────────────────────
+        _draw_fog(scr, fog, cam[0], cam[1])
+
+        # ── 8b. Day/night tint ────────────────────────────────────────────────
+        _draw_day_night_tint(scr, t)
+
+        # ── 9. Ghost building / wall drag preview ────────────────────────────
+        if world.meta.get('mode') == 'place_building':
+            kind = world.meta['place_type']
+            drag = world.meta.get('wall_drag_start')
+            if kind == 'wall' and drag is not None:
+                _draw_wall_drag_line(scr, cam, world, drag)
+            else:
+                _draw_ghost(scr, cam, kind, world)
+
+        # ── 10. Minimap (upper-left) ──────────────────────────────────────────
+        _draw_minimap(scr, world, 6)
+
+        # ── 11. HUD ───────────────────────────────────────────────────────────
+        _draw_hud(scr, world, self.font, self.small_font, t)
+
+        # ── 10b. FPS counter ─────────────────────────────────────────────────
+        if self._clock:
+            fps = self._clock.get_fps()
+            fps_col = P['hp_hi'] if fps >= 50 else P['hp_mid'] if fps >= 30 else P['hp_lo']
+            fps_txt = self.small_font.render(f"FPS: {int(fps)}", True, fps_col)
+            scr.blit(fps_txt, (W - fps_txt.get_width() - 6, 4))
+
+        # ── 11. Game-over ─────────────────────────────────────────────────────
+        go = world.meta.get('game_over')
+        if go:
+            _draw_game_over(scr, go, self.big_font, self.font)
+
+        pygame.display.flip()

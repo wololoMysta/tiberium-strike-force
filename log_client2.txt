@@ -1,0 +1,10 @@
+2026-03-28 11:50:31,071 [CLIENT] Connecting to ws://localhost:9876 ...
+2026-03-28 11:50:33,173 [CLIENT] Connected!
+2026-03-28 11:50:33,177 [CLIENT] Assigned team 1
+2026-03-28 11:50:33,563 [CLIENT] Waiting for first snapshot...
+2026-03-28 11:50:33,570 [CLIENT] Entering game loop
+2026-03-28 11:53:26,465 [CLIENT] Send: server closed connection: code=1001 reason=''
+2026-03-28 11:53:26,470 [CLIENT] Network thread stopped.
+2026-03-28 11:53:26,480 [CLIENT] Lost connection to server – shutting down client.
+pygame 2.6.1 (SDL 2.28.4, Python 3.13.12)
+Hello from the pygame community. https://www.pygame.org/contribute.html
